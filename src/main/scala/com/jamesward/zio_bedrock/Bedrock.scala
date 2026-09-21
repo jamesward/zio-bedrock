@@ -1,0 +1,1089 @@
+package com.jamesward.zio_bedrock
+
+import com.jamesward.zio_bedrock.internal.Codecs.given
+import com.jamesward.zio_bedrock.internal.{Codecs, Helpers, Protocol, TooledRequestImpl, Tools, Wire}
+import zio.*
+import zio.http.Status
+import zio.json.ast.Json
+import zio.schema.annotation.caseName
+import zio.schema.codec.json.schemaJson
+import zio.schema.{DynamicValue, Schema, derived}
+import zio.stream.*
+
+/** Shared Bedrock service capability. Backend layers provide a normalized
+  * protocol implementation consumed by the builders in the companion object.
+  */
+trait Bedrock:
+  private[zio_bedrock] def protocol: Protocol
+
+/**
+ * Shared typed API for Amazon Bedrock backends.
+ *
+ * The builders in this companion are pure data. Their terminals require the
+ * companion [[Bedrock]] service trait in the ZIO environment; backend facades
+ * such as [[Mantle]] and [[Converse]] provide that service through a normalized
+ * private SPI.
+ */
+object Bedrock:
+
+  // ---------- Opaque domain types ----------
+
+  // Each opaque type wrapping `String` exposes `.unwrap` rather than
+  // `.value`, because `java.lang.String` already has a private `value`
+  // field; INSIDE this scope the opaque type is transparent and `.value`
+  // would resolve to that private field and fail to compile.
+
+  opaque type ModelId = String
+  object ModelId:
+    def apply(s: String): ModelId = s
+    extension (m: ModelId) def unwrap: String = m
+
+  opaque type ApiKey = String
+  object ApiKey:
+    def apply(s: String): ApiKey = s
+    extension (k: ApiKey) def unwrap: String = k
+
+  opaque type ToolName = String
+  object ToolName:
+    def apply(s: String): ToolName = s
+    extension (t: ToolName) def unwrap: String = t
+    given Schema[ToolName] = Schema.primitive[String].transform(ToolName(_), identity)
+
+  opaque type ToolUseId = String
+  object ToolUseId:
+    def apply(s: String): ToolUseId = s
+    extension (t: ToolUseId) def unwrap: String = t
+    given Schema[ToolUseId] = Schema.primitive[String].transform(ToolUseId(_), identity)
+
+  /** All AWS commercial regions, plus GovCloud and China partitions. */
+  enum Region(val code: String):
+    case UsEast1       extends Region("us-east-1")
+    case UsEast2       extends Region("us-east-2")
+    case UsWest1       extends Region("us-west-1")
+    case UsWest2       extends Region("us-west-2")
+    case CaCentral1    extends Region("ca-central-1")
+    case CaWest1       extends Region("ca-west-1")
+    case MxCentral1    extends Region("mx-central-1")
+    case SaEast1       extends Region("sa-east-1")
+    case EuCentral1    extends Region("eu-central-1")
+    case EuCentral2    extends Region("eu-central-2")
+    case EuWest1       extends Region("eu-west-1")
+    case EuWest2       extends Region("eu-west-2")
+    case EuWest3       extends Region("eu-west-3")
+    case EuNorth1      extends Region("eu-north-1")
+    case EuSouth1      extends Region("eu-south-1")
+    case EuSouth2      extends Region("eu-south-2")
+    case AfSouth1      extends Region("af-south-1")
+    case MeSouth1      extends Region("me-south-1")
+    case MeCentral1    extends Region("me-central-1")
+    case IlCentral1    extends Region("il-central-1")
+    case ApEast1       extends Region("ap-east-1")
+    case ApEast2       extends Region("ap-east-2")
+    case ApSouth1      extends Region("ap-south-1")
+    case ApSouth2      extends Region("ap-south-2")
+    case ApNortheast1  extends Region("ap-northeast-1")
+    case ApNortheast2  extends Region("ap-northeast-2")
+    case ApNortheast3  extends Region("ap-northeast-3")
+    case ApSoutheast1  extends Region("ap-southeast-1")
+    case ApSoutheast2  extends Region("ap-southeast-2")
+    case ApSoutheast3  extends Region("ap-southeast-3")
+    case ApSoutheast4  extends Region("ap-southeast-4")
+    case ApSoutheast5  extends Region("ap-southeast-5")
+    case ApSoutheast7  extends Region("ap-southeast-7")
+    case UsGovEast1    extends Region("us-gov-east-1")
+    case UsGovWest1    extends Region("us-gov-west-1")
+    case CnNorth1      extends Region("cn-north-1")
+    case CnNorthwest1  extends Region("cn-northwest-1")
+
+  object Region:
+    def fromCode(code: String): Option[Region] = values.find(_.code == code)
+
+  // ---------- Strict equality ----------
+
+  given CanEqual[ModelId, ModelId]     = CanEqual.derived
+  given CanEqual[Region, Region]       = CanEqual.derived
+  given CanEqual[ApiKey, ApiKey]       = CanEqual.derived
+  given CanEqual[ToolName, ToolName]   = CanEqual.derived
+  given CanEqual[ToolUseId, ToolUseId] = CanEqual.derived
+  given CanEqual[Status, Status]       = CanEqual.derived
+
+  // ---------- Shared public enums ----------
+
+  enum Role derives Schema:
+    @caseName("user")      case User
+    @caseName("assistant") case Assistant
+
+  given CanEqual[Role, Role] = CanEqual.derived
+
+  enum StopReason derives Schema:
+    @caseName("stop")                          case EndTurn
+    @caseName("tool_calls")                    case ToolUse
+    @caseName("length")                        case MaxTokens
+    @caseName("stop_sequence")                 case StopSequence
+    @caseName("guardrail_intervened")          case GuardrailIntervened
+    @caseName("content_filter")                case ContentFiltered
+    @caseName("malformed_model_output")        case MalformedModelOutput
+    @caseName("malformed_tool_use")            case MalformedToolUse
+    @caseName("model_context_window_exceeded") case ModelContextWindowExceeded
+
+  given CanEqual[StopReason, StopReason] = CanEqual.derived
+
+  // ---------- Inference / metrics ----------
+
+  case class InferenceConfig(
+    maxTokens:     Int    | Null = null,
+    temperature:   Double | Null = null,
+    topP:          Double | Null = null,
+    stopSequences: List[String]  = Nil,
+  ) derives Schema
+
+  case class TokenUsage(
+    inputTokens:           Int,
+    outputTokens:          Int,
+    totalTokens:           Int,
+    cacheReadInputTokens:  Int | Null = null,
+    cacheWriteInputTokens: Int | Null = null,
+  ) derives Schema
+
+  /** Backend-reported model latency. `null` means the backend did not report it. */
+  case class Metrics(latencyMs: Long | Null = null) derives Schema
+
+  // ---------- Public Message / RequestConfig / Result ----------
+
+  /** Typed accessor for tool input data exchanged with the model.
+    * Hides the wire-level `DynamicValue` representation. Construct one
+    * via [[ToolInput.from]]; decode one via [[as]]. */
+  final class ToolInput private[zio_bedrock] (
+    private[zio_bedrock] val raw: DynamicValue,
+  ):
+    /** Decode this input into the typed `I` via its `Schema`. */
+    def as[I: Schema]: Either[String, I] = summon[Schema[I]].fromDynamic(raw)
+
+    /** Decode this input as the raw JSON object emitted by the model. */
+    def asJsonObject: Either[String, Json.Obj] =
+      summon[Schema[Json]].fromDynamic(raw).flatMap: json =>
+        json.asObject.toRight("Tool input must be a JSON object")
+
+  object ToolInput:
+    /** Wrap a typed value (encoded via its `Schema`) as a `ToolInput`. */
+    def from[A: Schema](value: A): ToolInput =
+      new ToolInput(summon[Schema[A]].toDynamic(value))
+
+  /** The server-reported status of a tool result block. */
+  enum ToolResultStatus:
+    case Success
+    case Error
+
+  given CanEqual[ToolResultStatus, ToolResultStatus] = CanEqual.derived
+
+  /** A block within a [[ContentBlock.ToolResult]]. The wire shape also
+    * supports `Image` / `Document` / `Video` payloads — those are
+    * deferred from the public API for now. */
+  enum ToolResultBlock:
+    case Text(text: String)
+    case Json(value: ToolInput)
+
+  object ToolResultBlock:
+    /** Build a JSON result block from a typed value via its `Schema`. */
+    def json[A: Schema](value: A): ToolResultBlock = Json(ToolInput.from(value))
+
+  /** A content block in a [[Message]].
+    *
+    *  - `Text`       — plain assistant text or user prompt.
+    *  - `ToolUse`    — model's call into a registered tool. Surface
+    *                     when the response's `stopReason` is `ToolUse`.
+    *  - `ToolResult` — caller's reply with the tool's output. Send
+    *                     this back in a follow-up `RequestConfig` so the
+    *                     model can continue.
+    *
+    * The wire format additionally carries `Image` / `Document` / `Video`
+    * / `CachePoint` / `ReasoningContent` blocks; those are filtered out
+    * at the public boundary in this slice. */
+  enum ContentBlock:
+    case Text(text: String)
+    case ToolUse(
+      toolUseId: ToolUseId,
+      name:      ToolName,
+      input:     ToolInput,
+    )
+    case ToolResult(
+      toolUseId: ToolUseId,
+      content:   List[ToolResultBlock],
+      status:    ToolResultStatus | Null = null,
+    )
+
+  /** A user or assistant message. Messages returned by a backend privately retain
+    * its exact normalized content (for example signed Converse reasoning blocks)
+    * so appending the message to a follow-up request is lossless.
+    */
+  final class Message private (
+    val role: Role,
+    val content: List[ContentBlock],
+    private[zio_bedrock] val retained: Wire.WireMessage | Null,
+  ):
+    /** Joined text from every `Text` content block. */
+    def text: String = content.collect { case ContentBlock.Text(t) => t }.mkString
+
+    /** Drop backend continuation data, retaining only portable public content. */
+    def portable: Message = Message(role, content)
+
+    override def equals(other: Any): Boolean = other match
+      case that: Message => role == that.role && java.util.Objects.equals(content, that.content)
+      case _             => false
+    override def hashCode: Int = 31 * role.hashCode + content.hashCode
+    override def toString: String = s"Message($role,$content)"
+
+  object Message:
+    def apply(role: Role, content: List[ContentBlock]): Message =
+      new Message(role, content, null)
+
+    def unapply(message: Message): Some[(Role, List[ContentBlock])] =
+      Some((message.role, message.content))
+
+    def user(text: String): Message = Message(Role.User, List(ContentBlock.Text(text)))
+    def assistant(text: String): Message = Message(Role.Assistant, List(ContentBlock.Text(text)))
+
+    private[zio_bedrock] def fromWire(wire: Wire.WireMessage): Message =
+      val publicContent = wire.content.collect:
+        case Wire.ContentBlock.Text(text)        => ContentBlock.Text(text)
+        case Wire.ContentBlock.ToolUse(value)    => Helpers.fromWireToolUse(value)
+        case Wire.ContentBlock.ToolResult(value) => Helpers.fromWireToolResult(value)
+      new Message(wire.role, publicContent, wire)
+
+  /** The user-facing request configuration handed to `Bedrock.chat`. */
+  /** An event from a backend streaming response. Exposed by
+    * `Bedrock.Request#asStream`. */
+  enum StreamEvent:
+    /** The model is producing text — one chunk (typically a few tokens). */
+    case TextDelta(text: String)
+    /** The model is producing reasoning/chain-of-thought content. */
+    case ReasoningDelta(text: String)
+    /** The model is calling a tool — start of a tool-use content block.
+      * The full input JSON arrives incrementally via [[ToolUseDelta]]. */
+    case ToolUseStart(toolUseId: ToolUseId, name: ToolName)
+    /** Incremental JSON fragment of a tool-use input. Buffer until
+      * [[ContentBlockStop]] to get the complete input. */
+    case ToolUseDelta(toolUseId: ToolUseId, inputJson: String)
+    /** A content block (text or tool-use) has completed. */
+    case ContentBlockStop(index: Int)
+    /** The model has finished its turn. */
+    case MessageStop(stopReason: StopReason)
+    /** Usage and latency metadata, emitted after the message completes. */
+    case Metadata(usage: TokenUsage, metrics: Metrics)
+    /** Terminal event containing the complete normalized model turn. */
+    case Complete(value: StreamComplete)
+
+  case class RequestConfig(
+    messages:        List[Message],
+    system:          String | Null          = null,
+    inferenceConfig: InferenceConfig | Null = null,
+    toolConfig:      ToolConfig | Null      = null,
+  )
+
+  object RequestConfig:
+    def apply(prompt: String): RequestConfig =
+      RequestConfig(messages = List(Message.user(prompt)))
+
+  /** Default `output` shape used by `.asResponse`. Mirrors AWS's wire
+    * `output.message` envelope. */
+  case class Output(message: Message):
+    /** Joined text from the assistant message's text content blocks. */
+    def text: String = message.text
+
+  /** Full response from one model turn, parameterised over the `output`
+    * type. `output` is an `Output` for `.asResponse`, the
+    * structured-output type `T` for `.asResponse[T]`. Wire/protocol
+    * failures arrive as `Bedrock.Error` in the ZIO error channel. */
+  case class Result[+T](
+    output:     T,
+    stopReason: StopReason,
+    usage:      TokenUsage,
+    metrics:    Metrics,
+  )
+
+  /** Completed streaming turn. The public result is safe to inspect; the
+    * private normalized response retains backend continuation blocks for loops. */
+  final class StreamComplete private[zio_bedrock] (
+    val result: Result[Output],
+    private[zio_bedrock] val response: Wire.ChatResponse,
+  )
+
+  private[zio_bedrock] object StreamComplete:
+    def fromWire(wire: Wire.ChatResponse): StreamComplete =
+      new StreamComplete(
+        Result(Output(Message.fromWire(wire.output.message)), wire.stopReason, wire.usage, wire.metrics),
+        wire,
+      )
+
+  // ---------- Tool ----------
+
+  /** A tool specification advertised to the model. Typed tools derive their
+    * input schema from `Schema[I]`; dynamic tools carry a runtime JSON Schema
+    * object verbatim. */
+  final class Tool[I] private[zio_bedrock] (
+    val name:        ToolName,
+    val description: String,
+    private[zio_bedrock] val inputSchema: Tool.SchemaSource,
+  )
+
+  object Tool:
+    private[zio_bedrock] enum SchemaSource:
+      case Typed(value: Schema[?])
+      case Dynamic(value: Json.Obj)
+
+    /** Build a typed tool with an explicit name. */
+    def apply[I: Schema](name: ToolName, description: String): Tool[I] =
+      new Tool[I](name, description, SchemaSource.Typed(summon[Schema[I]]))
+
+    /** Build a tool from a runtime JSON Schema object. The schema is forwarded
+      * to Bedrock verbatim, enabling dynamic catalogs such as MCP tools/list. */
+    def dynamic(name: ToolName, description: String, inputSchema: Json.Obj): Tool[Json.Obj] =
+      new Tool[Json.Obj](name, description, SchemaSource.Dynamic(inputSchema))
+
+  /** `.asTool` extension. Works on any `I => A` (pure) or `I => ZIO[R, E, A]`
+    * (effectful) — the function body is discarded; only the function's
+    * name is captured at compile time via the macro. */
+  extension [I: Schema, A](inline f: I => A)
+    inline def asTool(description: String): Tool[I] =
+      ${ com.jamesward.zio_bedrock.internal.ToolMacros.asTool[I]('f, 'description) }
+
+  /** Which tool the model is allowed to call. */
+  enum ToolChoice:
+    /** The model decides whether and which tool to call (default). */
+    case Auto
+    /** The model must call exactly one of the registered tools. */
+    case Any
+    /** The model must call this specific tool. */
+    case Tool(name: ToolName)
+
+  given CanEqual[ToolChoice, ToolChoice] = CanEqual.derived
+
+  /** Tool configuration attached to a [[RequestConfig]]. */
+  case class ToolConfig(
+    tools:      List[Tool[?]],
+    toolChoice: ToolChoice = ToolChoice.Auto,
+  )
+
+  /** Result returned by a runtime tool handler. */
+  case class DynamicToolResult(
+    content: List[ToolResultBlock],
+    status: ToolResultStatus = ToolResultStatus.Success,
+  )
+
+  object DynamicToolResult:
+    def text(value: String): DynamicToolResult =
+      DynamicToolResult(List(ToolResultBlock.Text(value)))
+
+  /** Metadata captured for one model turn in a dynamic tool loop. */
+  case class LoopTurn(
+    turn: Int,
+    stopReason: StopReason,
+    usage: TokenUsage,
+    metrics: Metrics,
+    toolNames: List[ToolName],
+  )
+
+  /** Aggregate usage and latency across every model turn. */
+  case class LoopTotals(usage: TokenUsage, latencyMs: Long | Null)
+
+  /** Final output plus complete per-turn and aggregate loop metrics. */
+  case class DynamicLoopResult[+A](
+    output: A,
+    stopReason: StopReason,
+    turns: List[LoopTurn],
+    totals: LoopTotals,
+  ):
+    def map[B](f: A => B): DynamicLoopResult[B] =
+      DynamicLoopResult(f(output), stopReason, turns, totals)
+
+  /** A multi-turn loop over runtime-defined tools. The library owns complete
+    * conversation history, matching tool-use/result IDs, iteration limits, and metrics. */
+  final class DynamicLoopRequest[R, E] private[zio_bedrock] (
+    prompt: String,
+    tools: List[Tool[?]],
+    handler: (ToolName, ToolInput) => ZIO[R, E, DynamicToolResult],
+    systemMessage: String | Null,
+    config: InferenceConfig | Null,
+    maxTurns: Int,
+  ):
+    def system(value: String): DynamicLoopRequest[R, E] =
+      new DynamicLoopRequest(prompt, tools, handler, value, config, maxTurns)
+
+    def inferenceConfig(value: InferenceConfig): DynamicLoopRequest[R, E] =
+      new DynamicLoopRequest(prompt, tools, handler, systemMessage, value, maxTurns)
+
+    def maxIterations(value: Int): DynamicLoopRequest[R, E] =
+      new DynamicLoopRequest(prompt, tools, handler, systemMessage, config, value)
+
+    def asResponse: ZIO[Bedrock & R, Error | E, DynamicLoopResult[Output]] =
+      com.jamesward.zio_bedrock.internal.LoopImpl.runDynamicLoop(
+        prompt,
+        tools,
+        handler,
+        systemMessage,
+        config,
+        maxTurns,
+      )
+
+    def text: ZIO[Bedrock & R, Error | E, DynamicLoopResult[String]] =
+      asResponse.map(_.map(_.text))
+
+  /** Build a library-managed loop for a runtime tool catalog. */
+  def dynamicLoop[R, E](
+    prompt: String,
+    tools: List[Tool[?]],
+  )(
+    handler: (ToolName, ToolInput) => ZIO[R, E, DynamicToolResult],
+  ): DynamicLoopRequest[R, E] =
+    new DynamicLoopRequest(prompt, tools, handler, null, null, 10)
+
+  // ────────────────────────────────────────────────────────────────────
+  // High-level: ToolHandler + ModelResponseTool
+  // ────────────────────────────────────────────────────────────────────
+
+  /** A tool handler bound to a typed function. Used by the high-level
+    * `Bedrock.request` flow.
+    *
+    * The handler-bearing companion of [[Tool]]: where `Tool[I]` is just
+    * a spec advertised to the model, `ToolHandler[I, R, E, A]` carries
+    * the function the framework runs when the model dispatches it.
+    *
+    * The tool's *name* is **not** stored here — it comes from the
+    * `NamedTuple` key when handlers are bundled into `Bedrock.request`.
+    *
+    * Type parameters `[-I, -R, +E <: Matchable, +A <: Matchable]`:
+    *  - `I` — input passed to the handler.
+    *  - `R` — environment the handler needs.
+    *  - `E` — error the handler can fail with (must have a `Schema`).
+    *  - `A` — output the handler produces (must have a `Schema`). */
+  final class ToolHandler[-I, -R, +E, +A <: Matchable] private[zio_bedrock] (
+    val description: String,
+    private[zio_bedrock] val inputSchema:  Schema[?],
+    private[zio_bedrock] val errorSchema:  Schema[?],
+    private[zio_bedrock] val outputSchema: Schema[?],
+    private[zio_bedrock] val handler:      I => ZIO[R, E, A],
+  )
+
+  object ToolHandler:
+
+    /** Build a `ToolHandler` from an effectful function. `Schema[E]` is
+      * required so `Bedrock.loop` can wire-encode the error when feeding
+      * it back to the model. */
+    def apply[I: Schema, R, E: Schema, A <: Matchable: Schema](
+      f:           I => ZIO[R, E, A],
+      description: String,
+    ): ToolHandler[I, R, E, A] =
+      new ToolHandler[I, R, E, A](
+        description,
+        summon[Schema[I]],
+        summon[Schema[E]],
+        summon[Schema[A]],
+        f,
+      )
+
+    /** Build a `ToolHandler` from an infallible effectful function
+      * (`E = Nothing`). No `Schema[E]` needed. */
+    def apply[I: Schema, R, A <: Matchable: Schema](
+      f:           I => URIO[R, A],
+      description: String,
+    )(using ev: DummyImplicit): ToolHandler[I, R, Nothing, A] =
+      new ToolHandler[I, R, Nothing, A](
+        description,
+        summon[Schema[I]],
+        summon[Schema[Nothing]],
+        summon[Schema[A]],
+        f,
+      )
+
+    /** Build a `ToolHandler` from a pure function. `E = Nothing` so no
+      * `Schema[E]` is required; we use the no-op `Schema[Nothing]` from
+      * `internal.Codecs.given_Schema_Nothing` internally. */
+    def fromPure[I: Schema, A <: Matchable: Schema](
+      f:           I => A,
+      description: String,
+    ): ToolHandler[I, Any, Nothing, A] =
+      new ToolHandler[I, Any, Nothing, A](
+        description,
+        summon[Schema[I]],
+        summon[Schema[Nothing]],
+        summon[Schema[A]],
+        (i: I) => ZIO.succeed(f(i)),
+      )
+
+  /** Pure-function `.asHandler` extension. */
+  extension [I: Schema, A <: Matchable: Schema](f: I => A)
+    def asHandler(description: String): ToolHandler[I, Any, Nothing, A] =
+      ToolHandler.fromPure(f, description)
+
+  /** Effectful-function `.asHandler` extension. Requires `Schema[E]`. */
+  extension [I: Schema, R, E: Schema, A <: Matchable: Schema](f: I => ZIO[R, E, A])
+    def asHandler(description: String): ToolHandler[I, R, E, A] =
+      ToolHandler(f, description)
+
+  /** Opt-in declaration that the model can produce a final reply (text
+    * or structured JSON) instead of dispatching a tool. Registering one
+    * of these in a `Bedrock.request` switches the wire `toolChoice` from
+    * `Any` (forced dispatch) to `Auto`.
+    *
+    * `text` and `Structured[A]` are mutually exclusive — registering
+    * both is rejected at compile time by `Bedrock.request`. */
+  sealed trait ModelResponseTool[+A <: Matchable]
+
+  object ModelResponseTool:
+    /** Free-form text reply. The model decides when to use it; no
+      * description is needed (the model already knows it can write
+      * text). */
+    case object text extends ModelResponseTool[String]
+
+    /** Structured reply — the model must produce JSON conforming to
+      * `Schema[A]`. The framework configures the wire
+      * `outputConfig.textFormat = json_schema(Schema[A])`. */
+    final class Structured[+A <: Matchable] private[zio_bedrock] (
+      val description: String,
+      private[zio_bedrock] val outputSchema: Schema[?],
+    ) extends ModelResponseTool[A]
+
+    /** Build a structured-reply tool from a description and a `Schema`. */
+    def apply[A <: Matchable: Schema](description: String): Structured[A] =
+      new Structured[A](description, summon[Schema[A]])
+
+  // ────────────────────────────────────────────────────────────────────
+  // Type-level evidence + match types for the high-level `Bedrock.request`
+  // ────────────────────────────────────────────────────────────────────
+
+  /** Compile-time witness that every element of the tuple `Hs` is one of
+    * `ToolHandler[?, ?, ?, ? <: Matchable]` or `ModelResponseTool[? <: Matchable]`.
+    * Built inductively so error messages name the offending element. */
+  sealed trait AllTools[Hs <: Tuple]
+  object AllTools:
+    given empty: AllTools[EmptyTuple] = new AllTools[EmptyTuple] {}
+
+    given consHandler[I, R, E, A <: Matchable, Tail <: Tuple](
+      using AllTools[Tail],
+    ): AllTools[ToolHandler[I, R, E, A] *: Tail] =
+      new AllTools[ToolHandler[I, R, E, A] *: Tail] {}
+
+    given consText[Tail <: Tuple](using AllTools[Tail])
+        : AllTools[ModelResponseTool.text.type *: Tail] =
+      new AllTools[ModelResponseTool.text.type *: Tail] {}
+
+    given consStructured[A <: Matchable, Tail <: Tuple](using AllTools[Tail])
+        : AllTools[ModelResponseTool.Structured[A] *: Tail] =
+      new AllTools[ModelResponseTool.Structured[A] *: Tail] {}
+
+  /** Aggregated environment requirement of every `ToolHandler` in `Hs`.
+    * `ModelResponseTool` cases contribute `Any`. Upper-bounded by `Any`
+    * so signatures referencing `EnvOf[Hs]` typecheck even when `Hs` is
+    * abstract. */
+  type EnvOf[Hs <: Tuple] <: Any = Hs match
+    case ToolHandler[?, r, ?, ?] *: rest => r & EnvOf[rest]
+    case _                       *: rest => EnvOf[rest]
+    case EmptyTuple                       => Any
+
+  /** Aggregated typed-error union of every `ToolHandler` in `Hs`.
+    * `ModelResponseTool` cases contribute nothing. */
+  type ErrorsOf[Hs <: Tuple] = Hs match
+    case ToolHandler[?, ?, e, ?] *: rest => e | ErrorsOf[rest]
+    case _                       *: rest => ErrorsOf[rest]
+    case EmptyTuple                       => Nothing
+
+  /** Per-element output type for the fold. */
+  type OutputOf[T] <: Matchable = T match
+    case ToolHandler[?, ?, ?, a]         => a
+    case ModelResponseTool.Structured[a] => a
+    case ModelResponseTool.text.type     => String
+
+  /** Tuple of per-tool fold functions. Each function takes the matching
+    * tool's `OutputOf[H]` and produces the unified `R`. */
+  type FoldFns[Hs <: Tuple, R] <: Tuple = Hs match
+    case h *: rest  => (OutputOf[h] => R) *: FoldFns[rest, R]
+    case EmptyTuple => EmptyTuple
+
+  /** Count of `ModelResponseTool.text` occurrences in `Hs`. */
+  type CountText[Hs <: Tuple] <: Int = Hs match
+    case ModelResponseTool.text.type *: rest =>
+      scala.compiletime.ops.int.+[1, CountText[rest]]
+    case _ *: rest =>
+      CountText[rest]
+    case EmptyTuple => 0
+
+  /** Count of `ModelResponseTool.Structured[?]` occurrences in `Hs`. */
+  type CountStructured[Hs <: Tuple] <: Int = Hs match
+    case ModelResponseTool.Structured[?] *: rest =>
+      scala.compiletime.ops.int.+[1, CountStructured[rest]]
+    case _ *: rest =>
+      CountStructured[rest]
+    case EmptyTuple => 0
+
+  /** True iff `Hs` registers a `ModelResponseTool` (text or structured).
+    * `Bedrock.loop` requires this to be `true` so the model has a way to
+    * terminate the loop with a reply. */
+  type HasReplyTool[Hs <: Tuple] <: Boolean = Hs match
+    case ModelResponseTool[?] *: _ => true
+    case _                    *: rest => HasReplyTool[rest]
+    case EmptyTuple                   => false
+
+  /** The output type of the registered `ModelResponseTool`. `String` for
+    * `ModelResponseTool.text`, `A` for `ModelResponseTool[A]`. The match
+    * type assumes exactly one is registered (enforced at compile time
+    * by the mutual-exclusion check). */
+  type ReplyOutput[Hs <: Tuple] <: Matchable = Hs match
+    case ModelResponseTool.text.type *: _      => String
+    case ModelResponseTool.Structured[a] *: _   => a
+    case _                            *: rest   => ReplyOutput[rest]
+    case EmptyTuple                             => Nothing
+
+
+  // ---------- Errors ----------
+
+  sealed trait Error extends Throwable:
+    /** Best-effort human-readable summary, surfaced as the throwable's
+      * `getMessage` so test frameworks and logs print something useful. */
+    def errorMessage: String
+    override def getMessage: String = errorMessage
+
+  object Error:
+    final case class Validation         (message: String)                                extends Error:
+      def errorMessage = s"Bedrock 400 Validation: $message"
+    final case class AccessDenied       (message: String)                                extends Error:
+      def errorMessage = s"Bedrock 403 AccessDenied: $message"
+    final case class ResourceNotFound   (message: String)                                extends Error:
+      def errorMessage = s"Bedrock 404 ResourceNotFound: $message"
+    final case class ModelTimeout       (message: String)                                extends Error:
+      def errorMessage = s"Bedrock 408 ModelTimeout: $message"
+    final case class ModelErr           (message: String, originalStatusCode: Int | Null) extends Error:
+      def errorMessage = s"Bedrock 424 ModelErr (orig=$originalStatusCode): $message"
+    final case class Throttling         (message: String)                                extends Error:
+      def errorMessage = s"Bedrock 429 Throttling: $message"
+    final case class InternalServer     (message: String)                                extends Error:
+      def errorMessage = s"Bedrock 500 InternalServer: $message"
+    final case class ServiceUnavailable (message: String)                                extends Error:
+      def errorMessage = s"Bedrock 503 ServiceUnavailable: $message"
+    final case class Unexpected         (status: Status, body: String)                   extends Error:
+      def errorMessage = s"Bedrock unexpected ${status.code}: $body"
+    final case class Transport          (cause: Throwable)                               extends Error:
+      def errorMessage = s"Transport error: ${cause.getMessage}"
+    final case class StructuredDecode   (responseText: String, message: String)          extends Error:
+      def errorMessage = s"Structured-output decode failed: $message (response text: $responseText)"
+    /** Model invoked a tool name that wasn't registered with the request. */
+    final case class UnknownTool        (name: ToolName)                                 extends Error:
+      def errorMessage = s"Model invoked unknown tool: $name"
+    /** Model invoked a registered tool but its input JSON didn't decode against `Schema[I]`. */
+    final case class InvalidToolInput   (name: ToolName, message: String)                extends Error:
+      def errorMessage = s"Invalid input for tool $name: $message"
+    /** Model produced a response that doesn't fit the registered tools. For
+      * example, free-form text when no `ModelResponseTool` is registered, or
+      * neither a recognised `tool_calls` entry nor a usable text reply. */
+    final case class UnexpectedReply    (description: String)                            extends Error:
+      def errorMessage = s"Unexpected model reply: $description"
+    /** `Bedrock.loop` ran for `iterations` turns without the model
+      * producing a final reply. Bounded loop only — never fires from
+      * `Bedrock.request`. */
+    final case class MaxIterations      (iterations: Int)                                 extends Error:
+      def errorMessage = s"Bedrock.loop exceeded maxIterations = $iterations"
+
+    private[zio_bedrock] def fromStatus(status: Status, body: String): Error =
+      status.code match
+        case 400 => Validation(body)
+        case 403 => AccessDenied(body)
+        case 404 => ResourceNotFound(body)
+        case 408 => ModelTimeout(body)
+        case 424 => ModelErr(body, null)
+        case 429 => Throttling(body)
+        case 500 => InternalServer(body)
+        case 503 => ServiceUnavailable(body)
+        case _   => Unexpected(status, body)
+
+    extension [R, A](zio: ZIO[R, Error, A])
+      def retryOnRetryable: ZIO[R, Error, A] =
+        zio.retry(
+          Schedule.recurWhile[Error]:
+            case _: (Throttling | InternalServer | ServiceUnavailable | ModelTimeout) => true
+            case _                                                                    => false
+          && Schedule.exponential(500.millis)
+          && Schedule.recurs(2)
+        )
+
+  // ---------- Request (the data builder) ----------
+
+  /** Builder/value returned by `Bedrock.chat`. Pure data; the
+    * terminals pull a `Bedrock` from the env. */
+  final class Request private[zio_bedrock] (
+    private[zio_bedrock] val cfg: RequestConfig,
+  ):
+    /** Final assistant text, joined across the model's last content blocks. */
+    def text: ZIO[Bedrock, Error, String] =
+      asResponse.map(_.output.text)
+
+    /** Stream text chunks as they arrive from the model. Each element is a
+      * text delta (typically a few tokens). The selected backend's streaming
+      * endpoint is used. */
+    def textStream: ZStream[Bedrock, Error, String] =
+      ZStream.serviceWithStream[Bedrock]: client =>
+        client.protocol.sendStream(Tools.toWire(cfg, outputConfig = None))
+
+    /** Stream the full event stream from the model. Exposes tool-use
+      * starts, text deltas, content-block stops, message stop, and metadata,
+      * followed by exactly one terminal [[StreamEvent.Complete]] event. */
+    def asStream: ZStream[Bedrock, Error, StreamEvent] =
+      ZStream.serviceWithStream[Bedrock]: client =>
+        client.protocol.completedStreamEvents(Tools.toWire(cfg, outputConfig = None))
+
+    /** Full response, with the assistant turn in `output.message`. */
+    def asResponse: ZIO[Bedrock, Error, Result[Output]] =
+      ZIO.serviceWithZIO[Bedrock]: client =>
+        client.protocol.send(Tools.toWire(cfg, outputConfig = None)).map: wire =>
+          Result(
+            output     = Output(Message.fromWire(wire.output.message)),
+            stopReason = wire.stopReason,
+            usage      = wire.usage,
+            metrics    = wire.metrics,
+          )
+
+    /** Structured output: the model is told to produce JSON matching
+      * `Schema[T]`, and the final text block is decoded into a `T`. */
+    def as[T <: Matchable: Schema]: ZIO[Bedrock, Error, T] =
+      asResponse[T].map(_.output)
+
+    /** Structured output with the full response envelope. */
+    def asResponse[T <: Matchable: Schema]: ZIO[Bedrock, Error, Result[T]] =
+      val rawJsonSchema = zio.http.endpoint.openapi.JsonSchema.fromZSchema(
+        summon[Schema[T]],
+        zio.http.endpoint.openapi.JsonSchema.SchemaRef(
+          zio.http.endpoint.openapi.JsonSchema.SchemaSpec.JsonSchema,
+          zio.http.endpoint.openapi.JsonSchema.SchemaStyle.Inline,
+        ),
+      )
+      // Bedrock requires every object schema in the structured-output
+      // schema document to set `additionalProperties: false`.
+      val outputJsonSchema = Helpers.withStrictObjects(rawJsonSchema).toJson
+      val outCfg = Wire.OutputConfig(Wire.TextFormat.JsonSchema(
+        Wire.JsonSchemaStructure(Wire.JsonSchemaSpec(
+          schema = outputJsonSchema,
+          name   = "structured_output",
+        )),
+      ))
+      ZIO.serviceWithZIO[Bedrock]: client =>
+        client.protocol.send(Tools.toWire(cfg, outputConfig = Some(outCfg))).flatMap: wire =>
+          val text = wire.output.message.content.collectFirst:
+            case Wire.ContentBlock.Text(t) => t
+          text match
+            case None =>
+              ZIO.fail(Error.StructuredDecode("", "no text block in response"))
+            case Some(t) =>
+              Helpers.decodeStructured[T](t) match
+                case Right(value) => ZIO.succeed(Result(value, wire.stopReason, wire.usage, wire.metrics))
+                case Left(error)  => ZIO.fail(Error.StructuredDecode(t, error))
+
+  // ---------- Top-level builders ----------
+
+  /** Build a low-level request from an explicit configuration. */
+  def chat(cfg: RequestConfig): Request =
+    new Request(cfg)
+
+  /** Single-prompt convenience for either Bedrock backend. */
+  def chat(prompt: String): Request =
+    new Request(RequestConfig(prompt))
+
+  /** Compatibility alias for applications migrating from zio-bedrock-converse. */
+  @deprecated("Use Bedrock.chat", "0.1.0")
+  def converse(cfg: RequestConfig): Request = chat(cfg)
+
+  /** Compatibility alias for applications migrating from zio-bedrock-converse. */
+  @deprecated("Use Bedrock.chat", "0.1.0")
+  def converse(prompt: String): Request = chat(prompt)
+
+  // ────────────────────────────────────────────────────────────────────
+  // High-level: TooledRequest + Bedrock.request(prompt, NamedTuple)
+  // ────────────────────────────────────────────────────────────────────
+
+  /** Single-turn high-level request. Carries the prompt + system +
+    * inferenceConfig and the pre-bundled handler / reply-tool registry.
+    *
+    * Construct via `Bedrock.request(prompt, namedTuple)`. The terminal
+    * is `.fold(...)` — a NamedTuple of per-tool functions whose keys
+    * must match those of the registered tools. */
+  final class TooledRequest[NT <: NamedTuple.AnyNamedTuple] @scala.annotation.publicInBinary private[zio_bedrock] (
+    private[zio_bedrock] val prompt:    String,
+    private[zio_bedrock] val systemMsg: String | Null,
+    private[zio_bedrock] val infCfg:    InferenceConfig | Null,
+    private[zio_bedrock] val handlers:  Map[ToolName, ToolHandler[?, ?, ?, ? <: Matchable]],
+    private[zio_bedrock] val replyTool: Option[(ToolName, ModelResponseTool[? <: Matchable])],
+  ):
+    /** Set or replace the system message. */
+    def system(s: String): TooledRequest[NT] =
+      new TooledRequest[NT](prompt, s, infCfg, handlers, replyTool)
+
+    /** Set or replace the inference configuration. */
+    def inferenceConfig(c: InferenceConfig): TooledRequest[NT] =
+      new TooledRequest[NT](prompt, systemMsg, c, handlers, replyTool)
+
+    /** Send the request and dispatch the response.
+      *
+      *  - If the model dispatches a registered tool: decode its input,
+      *    run the handler, apply the matching `cases` function to its
+      *    output. Handler `ZIO.fail(e)` propagates as `e` in the ZIO
+      *    error channel (typed as `ErrorsOf[Hs]`).
+      *  - If the model produces a reply (only possible when a
+      *    `ModelResponseTool` is registered): apply the matching `cases`
+      *    function. Decode failure for `ModelResponseTool[A]` →
+      *    `Bedrock.Error.StructuredDecode`.
+      *  - If neither (model misbehaves): `Bedrock.Error.UnexpectedReply`.
+      *
+      * The `cases` argument is a `NamedTuple` whose keys must be the
+      * same as the registered tools' keys, and whose value at each key
+      * is a function from the tool's typed output to the unified `R`.
+      *
+      * The ZIO error channel `Error | ErrorsOf[Hs]` carries every
+      * possible failure: `Bedrock.Error` for wire/protocol problems,
+      * the union of registered handler error types for handler
+      * failures. Forces explicit handling — there's no `Outcome.*`
+      * sum where a tool failure could be silently ignored. */
+    inline def fold[R <: Matchable](
+      cases: NamedTuple.NamedTuple[
+        NamedTuple.Names[NT],
+        FoldFns[NamedTuple.DropNames[NT], R],
+      ],
+    ): ZIO[
+      Bedrock & EnvOf[NamedTuple.DropNames[NT]],
+      Error | ErrorsOf[NamedTuple.DropNames[NT]],
+      Result[R],
+    ] =
+      val foldByName: Map[ToolName, Any => R] = TooledRequest.foldCasesToMap[NT, R](cases)
+      foldImpl[R](foldByName)
+        .asInstanceOf[
+          ZIO[
+            Bedrock & EnvOf[NamedTuple.DropNames[NT]],
+            Error | ErrorsOf[NamedTuple.DropNames[NT]],
+            Result[R],
+          ]
+        ]
+
+    private def foldImpl[R <: Matchable](
+      foldByName: Map[ToolName, Any => R],
+    ): ZIO[Bedrock, Any, Result[R]] =
+      TooledRequestImpl.foldImpl[R](this, foldByName)
+
+  object TooledRequest:
+    /** Inline conversion of a user-supplied `cases: NamedTuple` into a
+      * runtime `Map[ToolName, Any => R]` keyed by the NamedTuple's
+      * compile-time names. */
+    private[zio_bedrock] inline def foldCasesToMap[
+      NT <: NamedTuple.AnyNamedTuple,
+      R <: Matchable,
+    ](
+      cases: NamedTuple.NamedTuple[
+        NamedTuple.Names[NT],
+        FoldFns[NamedTuple.DropNames[NT], R],
+      ],
+    ): Map[ToolName, Any => R] =
+      val namesTup = compiletime.constValueTuple[NamedTuple.Names[NT]]
+      val nameList = namesTup.toList.asInstanceOf[List[String]]
+      val valuesList = cases.asInstanceOf[Tuple].toList.asInstanceOf[List[Any => R]]
+      nameList.iterator.zip(valuesList.iterator).map: (n, f) =>
+        (ToolName(n), f)
+      .toMap
+
+    /** Inline construction of a `TooledRequest` from a compile-time
+      * NamedTuple of tools. Walks the names + values in parallel,
+      * separating `ToolHandler`s into the registry and identifying the
+      * (at most one) reply tool. */
+    private[zio_bedrock] inline def fromTools[NT <: NamedTuple.AnyNamedTuple](
+      prompt: String,
+      tools:  NT,
+    ): TooledRequest[NT] =
+      val namesTup = compiletime.constValueTuple[NamedTuple.Names[NT]]
+      val nameList = namesTup.toList.asInstanceOf[List[String]]
+      val valuesList = tools.asInstanceOf[Tuple].toList
+      val handlers = scala.collection.mutable.Map.empty[
+        ToolName,
+        ToolHandler[?, ?, ?, ? <: Matchable],
+      ]
+      var replyTool: Option[(ToolName, ModelResponseTool[? <: Matchable])] = None
+      nameList.iterator.zip(valuesList.iterator).foreach: (n, v) =>
+        val tn = ToolName(n)
+        v match
+          case h: ToolHandler[?, ?, ?, ?] =>
+            handlers(tn) = h.asInstanceOf[
+              ToolHandler[?, ?, ?, ? <: Matchable]
+            ]
+          case mrt: ModelResponseTool[?] =>
+            replyTool = Some((tn, mrt.asInstanceOf[ModelResponseTool[? <: Matchable]]))
+      new TooledRequest[NT](
+        prompt    = prompt,
+        systemMsg = null,
+        infCfg    = null,
+        handlers  = handlers.toMap,
+        replyTool = replyTool,
+      )
+
+  /** Build a single-turn high-level request bound to the given prompt
+    * and a `NamedTuple` of registered tools.
+    *
+    * Compile-time enforcement:
+    *   - The tuple is non-empty.
+    *   - Every element is a `ToolHandler[…]` or a `ModelResponseTool[…]`.
+    *   - At most one of `ModelResponseTool.text` / `ModelResponseTool[A]`. */
+  inline def request[NT <: NamedTuple.AnyNamedTuple](
+    prompt: String,
+    tools:  NT,
+  )(using
+    inline ev:        NamedTuple.DropNames[NT] <:< NonEmptyTuple,
+    inline allTools:  AllTools[NamedTuple.DropNames[NT]],
+  ): TooledRequest[NT] =
+    inline val nText       = compiletime.constValue[CountText[NamedTuple.DropNames[NT]]]
+    inline val nStructured = compiletime.constValue[CountStructured[NamedTuple.DropNames[NT]]]
+    inline if nText + nStructured > 1 then
+      compiletime.error(
+        "Only one of `ModelResponseTool.text` or `ModelResponseTool[A]` may be registered.",
+      )
+    else
+      TooledRequest.fromTools[NT](prompt, tools)
+
+  // ────────────────────────────────────────────────────────────────────
+  // Multi-turn: Bedrock.loop
+  // ────────────────────────────────────────────────────────────────────
+
+  /** Multi-turn agentic loop. Dispatches tool calls, feeds results (or
+    * errors) back to the model, and repeats until the model produces a
+    * final reply or `maxIterations` is hit.
+    *
+    * Handler `ZIO.fail(e)` is **not** propagated to the caller — it's
+    * encoded via `Schema[E]` and sent back to the model as
+    * `tool_result.status = Error`. The model can then decide to retry,
+    * call a different tool, or produce a final reply.
+    *
+    * `UnknownTool` and `InvalidToolInput` are also fed back to the model
+    * (not surfaced as ZIO failures) so the model can self-correct.
+    *
+    * The only failures that surface in the ZIO error channel are
+    * `Bedrock.Error` (wire/protocol) and `MaxIterations`.
+    *
+    * The terminal (`.text`, `.as[T]`, `.asResponse`, `.asResponse[T]`)
+    * determines the reply shape — same as `Bedrock.Request`. No
+    * `ModelResponseTool` is exposed to the user; the loop internally
+    * uses `toolChoice = Auto` and the terminal's output config. */
+  final class LoopRequest[NT <: NamedTuple.AnyNamedTuple] @scala.annotation.publicInBinary private[zio_bedrock] (
+    private[zio_bedrock] val prompt:    String,
+    private[zio_bedrock] val systemMsg: String | Null,
+    private[zio_bedrock] val infCfg:    InferenceConfig | Null,
+    private[zio_bedrock] val maxIter:   Int,
+    private[zio_bedrock] val handlers:  Map[ToolName, ToolHandler[?, ?, ?, ? <: Matchable]],
+  ):
+    def system(s: String):              LoopRequest[NT] =
+      new LoopRequest[NT](prompt, s, infCfg, maxIter, handlers)
+    def inferenceConfig(c: InferenceConfig): LoopRequest[NT] =
+      new LoopRequest[NT](prompt, systemMsg, c, maxIter, handlers)
+    def maxIterations(n: Int):          LoopRequest[NT] =
+      new LoopRequest[NT](prompt, systemMsg, infCfg, n, handlers)
+
+    /** Final assistant text after the loop completes. */
+    def text: ZIO[Bedrock & EnvOf[NamedTuple.DropNames[NT]], Error, String] =
+      asResponse.map(_.output.text).asInstanceOf[ZIO[Bedrock & EnvOf[NamedTuple.DropNames[NT]], Error, String]]
+
+    /** Stream text from the loop. Every turn uses the streaming endpoint.
+      * Tool-dispatch turns are consumed internally (no text emitted);
+      * text deltas from the final reply stream through to the caller. */
+    def textStream: ZStream[Bedrock & EnvOf[NamedTuple.DropNames[NT]], Error, String] =
+      com.jamesward.zio_bedrock.internal.LoopImpl.runLoopStream(this, outputConfig = None).asInstanceOf[ZStream[Bedrock & EnvOf[NamedTuple.DropNames[NT]], Error, String]]
+
+    /** Stream all events from every turn, including intermediate tool calls.
+      * Intermediate turns do not emit `Complete`; the complete final result is
+      * emitted exactly once as the terminal event. */
+    def asStream: ZStream[Bedrock & EnvOf[NamedTuple.DropNames[NT]], Error, StreamEvent] =
+      com.jamesward.zio_bedrock.internal.LoopImpl.runLoopEventStream(this, outputConfig = None).asInstanceOf[ZStream[Bedrock & EnvOf[NamedTuple.DropNames[NT]], Error, StreamEvent]]
+
+    /** Full response envelope after the loop completes. */
+    def asResponse: ZIO[Bedrock & EnvOf[NamedTuple.DropNames[NT]], Error, Result[Output]] =
+      com.jamesward.zio_bedrock.internal.LoopImpl.runLoop(this, outputConfig = None).map: (wire) =>
+        Result(
+          output     = Output(Message.fromWire(wire.output.message)),
+          stopReason = wire.stopReason,
+          usage      = wire.usage,
+          metrics    = wire.metrics,
+        )
+      .asInstanceOf[ZIO[Bedrock & EnvOf[NamedTuple.DropNames[NT]], Error, Result[Output]]]
+
+    /** Structured output: the model's final reply is decoded via `Schema[T]`. */
+    def as[T <: Matchable: Schema]: ZIO[Bedrock & EnvOf[NamedTuple.DropNames[NT]], Error, T] =
+      asResponse[T].map(_.output).asInstanceOf[ZIO[Bedrock & EnvOf[NamedTuple.DropNames[NT]], Error, T]]
+
+    /** Structured output with the full response envelope. */
+    def asResponse[T <: Matchable: Schema]: ZIO[Bedrock & EnvOf[NamedTuple.DropNames[NT]], Error, Result[T]] =
+      val rawJsonSchema = zio.http.endpoint.openapi.JsonSchema.fromZSchema(
+        summon[Schema[T]],
+        zio.http.endpoint.openapi.JsonSchema.SchemaRef(
+          zio.http.endpoint.openapi.JsonSchema.SchemaSpec.JsonSchema,
+          zio.http.endpoint.openapi.JsonSchema.SchemaStyle.Inline,
+        ),
+      )
+      val outputJsonSchema = Helpers.withStrictObjects(rawJsonSchema).toJson
+      val outCfg = Wire.OutputConfig(Wire.TextFormat.JsonSchema(
+        Wire.JsonSchemaStructure(Wire.JsonSchemaSpec(
+          schema = outputJsonSchema,
+          name   = "structured_output",
+        )),
+      ))
+      com.jamesward.zio_bedrock.internal.LoopImpl.runLoop(this, outputConfig = Some(outCfg)).flatMap: wire =>
+        val text = wire.output.message.content.collectFirst:
+          case Wire.ContentBlock.Text(t) => t
+        text match
+          case None =>
+            ZIO.fail(Error.StructuredDecode("", "no text block in loop response"))
+          case Some(t) =>
+            Helpers.decodeStructured[T](t) match
+              case Right(value) => ZIO.succeed(Result(value, wire.stopReason, wire.usage, wire.metrics))
+              case Left(error)  => ZIO.fail(Error.StructuredDecode(t, error))
+      .asInstanceOf[ZIO[Bedrock & EnvOf[NamedTuple.DropNames[NT]], Error, Result[T]]]
+
+  object LoopRequest:
+    private[zio_bedrock] inline def fromTools[NT <: NamedTuple.AnyNamedTuple](
+      prompt: String,
+      tools:  NT,
+    ): LoopRequest[NT] =
+      val namesTup = compiletime.constValueTuple[NamedTuple.Names[NT]]
+      val nameList = namesTup.toList.asInstanceOf[List[String]]
+      val valuesList = tools.asInstanceOf[Tuple].toList
+      val handlers = scala.collection.mutable.Map.empty[
+        ToolName,
+        ToolHandler[?, ?, ?, ? <: Matchable],
+      ]
+      nameList.iterator.zip(valuesList.iterator).foreach: (n, v) =>
+        val tn = ToolName(n)
+        v match
+          case h: ToolHandler[?, ?, ?, ?] =>
+            handlers(tn) = h.asInstanceOf[ToolHandler[?, ?, ?, ? <: Matchable]]
+          case _ => ()  // shouldn't happen — AllTools enforces
+      new LoopRequest[NT](
+        prompt    = prompt,
+        systemMsg = null,
+        infCfg    = null,
+        maxIter   = 10,
+        handlers  = handlers.toMap,
+      )
+
+  /** Build a multi-turn agentic loop. The terminal (`.text`, `.as[T]`,
+    * `.asResponse`, `.asResponse[T]`) determines the reply shape.
+    *
+    * Compile-time enforcement:
+    *   - Non-empty tools.
+    *   - Every element is a `ToolHandler[…]`.
+    *   - No `ModelResponseTool` (the reply shape is chosen at the terminal). */
+  inline def loop[NT <: NamedTuple.AnyNamedTuple](
+    prompt: String,
+    tools:  NT,
+  )(using
+    inline ev:        NamedTuple.DropNames[NT] <:< NonEmptyTuple,
+    inline allTools:  AllTools[NamedTuple.DropNames[NT]],
+  ): LoopRequest[NT] =
+    inline val nText       = compiletime.constValue[CountText[NamedTuple.DropNames[NT]]]
+    inline val nStructured = compiletime.constValue[CountStructured[NamedTuple.DropNames[NT]]]
+    inline if nText + nStructured > 0 then
+      compiletime.error(
+        "Bedrock.loop does not accept ModelResponseTool — the reply shape is determined by the terminal (.text, .as[T], etc.).",
+      )
+    else
+      LoopRequest.fromTools[NT](prompt, tools)
+
+
+  // (Wire ↔ public translation lives in internal/Helpers.scala)
