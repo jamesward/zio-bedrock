@@ -34,9 +34,19 @@ object MantleProtocolSpec extends ZIOSpecDefault:
   private def field(value: Json, name: String): Json =
     value.asObject.flatMap(_.get(name)).getOrElse(throw new AssertionError(s"missing '$name' in $value"))
 
-  private def clientLayer(httpClient: HttpClient, port: Int): ULayer[Bedrock] =
+  private def clientLayer(
+    httpClient: HttpClient,
+    port: Int,
+    api: MantleApi = MantleApi.Standard,
+  ): ULayer[Bedrock] =
     val endpoint = URL.decode(s"http://localhost:$port").toOption.get
-    ZLayer.succeed(httpClient) >>> Mantle.layer(MantleConfig(ApiKey("test-secret"), endpoint, model))
+    ZLayer.succeed(httpClient) >>> Mantle.layer(MantleConfig(
+      ApiKey("test-secret"),
+      Region.UsEast1,
+      model,
+      endpoint,
+      api,
+    ))
 
   def spec = suite("Bedrock Mantle protocol integration")(
     test("encodes OpenAI chat, tools, structured output, inference config, and bearer auth") {
@@ -82,11 +92,43 @@ object MantleProtocolSpec extends ZIOSpecDefault:
         result.usage.inputTokens == 7,
         result.usage.outputTokens == 3,
         result.usage.totalTokens == 10,
-        result.metrics.latencyMs.asInstanceOf[AnyRef] eq null,
+        result.metrics.latencyMs == 0L,
         result.stopReason == StopReason.EndTurn,
       )
     },
 
+    test("uses the OpenAI API base when configured") {
+      for
+        captured <- Promise.make[Nothing, Unit]
+        routes = Routes(
+          Method.POST / "openai" / "v1" / "chat" / "completions" -> handler { (_: HttpRequest) =>
+            captured.succeed(()) *>
+              ZIO.succeed(Response.json(completion("ok")))
+          },
+        )
+        port <- Server.install(routes)
+        http <- ZIO.service[HttpClient]
+        result <- Bedrock.chat("hello").text.provideLayer(clientLayer(http, port, MantleApi.OpenAI))
+        _ <- captured.await
+      yield assertTrue(result == "ok")
+    },
+    test("retains a custom endpoint path before the standard API base") {
+      for
+        captured <- Promise.make[Nothing, Unit]
+        routes = Routes(
+          Method.POST / "openai" / "v1" / "chat" / "completions" -> handler { (_: HttpRequest) =>
+            captured.succeed(()) *>
+              ZIO.succeed(Response.json(completion("ok")))
+          },
+        )
+        port <- Server.install(routes)
+        http <- ZIO.service[HttpClient]
+        endpoint = URL.decode(s"http://localhost:$port/openai").toOption.get
+        layer = ZLayer.succeed(http) >>> Mantle.layer(MantleConfig(ApiKey("test-secret"), endpoint, model))
+        result <- Bedrock.chat("hello").text.provideLayer(layer)
+        _ <- captured.await
+      yield assertTrue(result == "ok")
+    },
     test("loop sends assistant tool_calls followed by role=tool result") {
       for
         bodies <- Ref.make(List.empty[String])
@@ -162,7 +204,7 @@ object MantleProtocolSpec extends ZIOSpecDefault:
         field(field(request, "stream_options"), "include_usage").asBoolean.contains(true),
         complete.exists(_.output.text == "hello"),
         complete.exists(value => value.usage.inputTokens == 2 && value.usage.outputTokens == 1 && value.usage.totalTokens == 3),
-        complete.exists(_.metrics.latencyMs.asInstanceOf[AnyRef] eq null),
+        complete.exists(_.metrics.latencyMs == 0L),
       )
     },
 

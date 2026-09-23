@@ -11,8 +11,6 @@ import zio.stream.*
 /** HTTP transport for Bedrock Mantle's OpenAI-compatible Chat Completions API. */
 private[zio_bedrock] object MantleTransport:
 
-  private val chatCompletionsPath = "/v1/chat/completions"
-
   def build(config: MantleConfig, client: Client): Bedrock =
     val endpoint = Option(config.endpoint.asInstanceOf[URL]).getOrElse:
       URL.decode(s"https://bedrock-mantle.${config.region.code}.api.aws").toOption.get
@@ -20,12 +18,13 @@ private[zio_bedrock] object MantleTransport:
       .url(endpoint)
       .addHeader(Header.Authorization.Bearer(config.apiKey.unwrap))
       .addHeader(Header.ContentType(MediaType.application.json))
-    val transport = new MantleProtocol(config.modelId, authedClient)
+    val transport = new MantleProtocol(config.modelId, s"${config.api.basePath}/chat/completions", authedClient)
     new Bedrock:
       private[zio_bedrock] val protocol: Protocol = transport
 
   private final class MantleProtocol(
     modelId: Bedrock.ModelId,
+    chatCompletionsPath: String,
     hc: Client,
   ) extends Protocol:
 

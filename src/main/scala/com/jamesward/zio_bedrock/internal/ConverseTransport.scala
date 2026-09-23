@@ -155,7 +155,7 @@ private[zio_bedrock] object ConverseTransport:
             extractJsonInt(event.payload, "cacheWriteInputTokens").map(_.asInstanceOf[Int | Null]).getOrElse(null),
           )
           val metrics = Bedrock.Metrics(
-            extractJsonLong(event.payload, "latencyMs").map(_.asInstanceOf[Long | Null]).getOrElse(null),
+            extractJsonLong(event.payload, "latencyMs").getOrElse(0L),
           )
           complete(usage, metrics).map(response =>
             List(Metadata(usage, metrics), Complete(Bedrock.StreamComplete.fromWire(response))),

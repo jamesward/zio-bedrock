@@ -26,6 +26,9 @@ trait Bedrock:
  */
 object Bedrock:
 
+  type Middleware = BedrockMiddleware
+  val Middleware: BedrockMiddleware.type = BedrockMiddleware
+
   // ---------- Opaque domain types ----------
 
   // Each opaque type wrapping `String` exposes `.unwrap` rather than
@@ -145,8 +148,8 @@ object Bedrock:
     cacheWriteInputTokens: Int | Null = null,
   ) derives Schema
 
-  /** Backend-reported model latency. `null` means the backend did not report it. */
-  case class Metrics(latencyMs: Long | Null = null) derives Schema
+  /** Backend-reported model latency in milliseconds; zero when unavailable. */
+  case class Metrics(latencyMs: Long = 0L) derives Schema
 
   // ---------- Public Message / RequestConfig / Result ----------
 
@@ -159,9 +162,12 @@ object Bedrock:
     /** Decode this input into the typed `I` via its `Schema`. */
     def as[I: Schema]: Either[String, I] = summon[Schema[I]].fromDynamic(raw)
 
+    /** Decode this input as raw JSON emitted by the model. */
+    def asJson: Either[String, Json] = summon[Schema[Json]].fromDynamic(raw)
+
     /** Decode this input as the raw JSON object emitted by the model. */
     def asJsonObject: Either[String, Json.Obj] =
-      summon[Schema[Json]].fromDynamic(raw).flatMap: json =>
+      asJson.flatMap: json =>
         json.asObject.toRight("Tool input must be a JSON object")
 
   object ToolInput:
@@ -308,6 +314,16 @@ object Bedrock:
     private[zio_bedrock] val response: Wire.ChatResponse,
   )
 
+  /** One validated model tool call with the complete response metadata. */
+  case class ForcedToolUseResult(
+    toolUseId: ToolUseId,
+    name: ToolName,
+    input: ToolInput,
+    stopReason: StopReason,
+    usage: TokenUsage,
+    metrics: Metrics,
+  )
+
   private[zio_bedrock] object StreamComplete:
     def fromWire(wire: Wire.ChatResponse): StreamComplete =
       new StreamComplete(
@@ -384,7 +400,7 @@ object Bedrock:
   )
 
   /** Aggregate usage and latency across every model turn. */
-  case class LoopTotals(usage: TokenUsage, latencyMs: Long | Null)
+  case class LoopTotals(usage: TokenUsage, latencyMs: Long)
 
   /** Final output plus complete per-turn and aggregate loop metrics. */
   case class DynamicLoopResult[+A](
@@ -659,6 +675,12 @@ object Bedrock:
       def errorMessage = s"Bedrock 500 InternalServer: $message"
     final case class ServiceUnavailable (message: String)                                extends Error:
       def errorMessage = s"Bedrock 503 ServiceUnavailable: $message"
+    final case class MissingToolUse(expected: ToolName) extends Error:
+      def errorMessage = s"Expected one tool use for $expected, but the model returned none"
+    final case class MultipleToolUses(expected: ToolName, actual: Int) extends Error:
+      def errorMessage = s"Expected one tool use for $expected, but the model returned $actual"
+    final case class UnexpectedToolUse(expected: ToolName, actual: ToolName) extends Error:
+      def errorMessage = s"Expected tool use $expected, but the model called $actual"
     final case class Unexpected         (status: Status, body: String)                   extends Error:
       def errorMessage = s"Bedrock unexpected ${status.code}: $body"
     final case class Transport          (cause: Throwable)                               extends Error:
@@ -739,6 +761,25 @@ object Bedrock:
             usage      = wire.usage,
             metrics    = wire.metrics,
           )
+
+    /** Require exactly one invocation of `expected`, retaining complete response metadata. */
+    def asForcedToolUse(expected: ToolName): ZIO[Bedrock, Error, ForcedToolUseResult] =
+      asResponse.flatMap: response =>
+        val uses = response.output.message.content.collect:
+          case ContentBlock.ToolUse(id, name, input) => (id, name, input)
+        uses match
+          case Nil => ZIO.fail(Error.MissingToolUse(expected))
+          case _ :: _ :: _ => ZIO.fail(Error.MultipleToolUses(expected, uses.size))
+          case (id, actual, input) :: Nil =>
+            if actual != expected then ZIO.fail(Error.UnexpectedToolUse(expected, actual))
+            else ZIO.succeed(ForcedToolUseResult(id, actual, input, response.stopReason, response.usage, response.metrics))
+
+    /** Require one expected tool call and decode its input as a JSON object. */
+    def asForcedToolObject(expected: ToolName): ZIO[Bedrock, Error, Result[Json.Obj]] =
+      asForcedToolUse(expected).flatMap: toolUse =>
+        ZIO.fromEither(toolUse.input.asJsonObject)
+          .mapError(message => Error.InvalidToolInput(expected, message))
+          .map(value => Result(value, toolUse.stopReason, toolUse.usage, toolUse.metrics))
 
     /** Structured output: the model is told to produce JSON matching
       * `Schema[T]`, and the final text block is decoded into a `T`. */

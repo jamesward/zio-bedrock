@@ -42,6 +42,9 @@ object BedrockMock:
     case class CallTool[I: Schema](toolName: ToolName, input: I) extends MockBehavior:
       val schema: Schema[I] = summon[Schema[I]]
 
+    /** The model invokes multiple tools in one response. */
+    case class CallTools(calls: List[(ToolName, Json)]) extends MockBehavior
+
     /** The model fails the chat-completion call with the given error. */
     case class Fail(error: Error) extends MockBehavior
 
@@ -103,6 +106,14 @@ object BedrockMock:
           input     = b.schema.toDynamic(b.input),
         )
         ZIO.succeed(wrap(List(Wire.ContentBlock.ToolUse(tu)), StopReason.ToolUse))
+      case Some(MockBehavior.CallTools(calls)) =>
+        val content = calls.map: (name, input) =>
+          Wire.ContentBlock.ToolUse(Wire.ToolUseContent(
+            ToolUseId(java.util.UUID.randomUUID().toString),
+            name,
+            summon[Schema[Json]].toDynamic(input),
+          ))
+        ZIO.succeed(wrap(content, StopReason.ToolUse))
       case Some(MockBehavior.Fail(error)) =>
         ZIO.fail(error)
 

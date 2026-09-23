@@ -152,7 +152,7 @@ object DynamicToolSpec extends ZIOSpecDefault:
           result.totals.usage.totalTokens == 35,
           result.totals.usage.cacheReadInputTokens.asInstanceOf[Int] == 8,
           result.totals.usage.cacheWriteInputTokens.asInstanceOf[Int] == 4,
-          result.totals.latencyMs.asInstanceOf[Long] == 12L,
+          result.totals.latencyMs == 12L,
           invoked.exists((name, args) => name == ToolName("runtime_search") && args.get("query").flatMap(_.asString).contains("jackson")),
           history.map(_.role) == List(Role.User, Role.Assistant, Role.User),
           reasoning.flatMap(_.reasoningText).exists(block => block.text == "thinking" && block.signature.contains("signature-1")),
@@ -160,7 +160,7 @@ object DynamicToolSpec extends ZIOSpecDefault:
           resultId == assistantId,
         )
     },
-    test("dynamicLoop aggregate latency remains unknown when a backend does not report it") {
+    test("dynamicLoop aggregate latency is zero when a backend does not report it") {
       val unknownLatency = ZLayer.succeed(new Bedrock:
         private[zio_bedrock] val protocol: Protocol = new Protocol:
           def send(request: Wire.ChatRequest) = ZIO.succeed(Wire.ChatResponse(
@@ -174,7 +174,7 @@ object DynamicToolSpec extends ZIOSpecDefault:
       Bedrock.dynamicLoop("done", Nil)((_, _) => ZIO.succeed(DynamicToolResult.text("unused")))
         .text
         .provideLayer(unknownLatency)
-        .map(result => assertTrue(result.totals.latencyMs.asInstanceOf[AnyRef] eq null))
+        .map(result => assertTrue(result.totals.latencyMs == 0L))
     },
     test("dynamicLoop dispatches same-turn tools in parallel and preserves result order") {
       val schema = Json.Obj("type" -> Json.Str("object"), "properties" -> Json.Obj())

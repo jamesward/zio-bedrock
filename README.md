@@ -70,6 +70,21 @@ Mantle.layer(MantleConfig(
 ))
 ```
 
+Models served from the provider-specific OpenAI-compatible API base, including
+xAI Grok and closed-weight OpenAI models, require `MantleApi.OpenAI`:
+
+```scala
+Mantle.layer(MantleConfig(
+  ApiKey("…"),
+  Region.UsEast1,
+  ModelId("xai.grok-4.3"),
+  api = MantleApi.OpenAI,
+))
+```
+
+The default `MantleApi.Standard` continues to use `/v1/chat/completions`;
+`MantleApi.OpenAI` uses `/openai/v1/chat/completions`.
+
 A custom origin is also supported for a Mantle-compatible local service such
 as [acprock](https://github.com/jamesward/acprock); the client still posts to
 `/v1/chat/completions`:
@@ -107,6 +122,8 @@ path encoding and `/converse` or `/converse-stream` are still supplied by the
 transport:
 
 ```scala
+import zio.http.URL
+
 Converse.layer(ConverseConfig(
   ApiKey("dev"),
   URL.decode("http://localhost:9999").toOption.get,
@@ -114,9 +131,37 @@ Converse.layer(ConverseConfig(
 ))
 ```
 
+### Bedrock middleware
+
+Decorate either backend layer using ZIO HTTP-style `@@` / `++` composition.
+The left middleware wraps the right middleware:
+
+```scala
+import com.jamesward.zio_bedrock.Bedrock.*
+
+val bedrock = Converse.layer(config) @@ Middleware.logging()
+val composed = Mantle.layer(config) @@ (metricsMiddleware ++ Middleware.logging())
+```
+
+`Middleware.make` receives the normalized canonical request and can wrap both
+unary and streaming effects. Use it for retries, tracing, metrics, policy
+checks, or other cross-cutting behavior:
+
+```scala
+val retryThrottling = Middleware.make: (_, next) =>
+  next.catchSome:
+    case _: Error.Throttling => next
+```
+
+`Middleware.logging()` logs complete normalized requests, canonical unary
+responses, stream completion/failure, and unary latency. Configure body
+inclusion with `Middleware.LoggingConfig`. Authentication headers and API keys
+are never present, but prompts, tool input, and model output may be sensitive,
+so logging is opt-in.
+
 ## Basic inference (`Bedrock.chat`)
 
-Five terminals, one prompt each. Every example below assumes either
+Core terminals, one prompt each. Every example below assumes either
 `Mantle.live` / `Converse.live` (or `Client.default` plus the corresponding
 `configured` layer) in scope.
 
@@ -150,11 +195,15 @@ pass a `RequestConfig` directly.
 A structured-output decode failure surfaces as
 `Bedrock.Error.StructuredDecode(responseText, message)`.
 
-`asStream` exposes normalized delta, stop, and metadata events and always ends
-with exactly one `StreamEvent.Complete`, whose `result` contains the complete
-public model turn. Shared streaming loops suppress intermediate completion
-markers and retain exact backend continuation blocks such as Converse reasoning
-signatures.
+`asStream` exposes normalized delta, stop, and metadata events. Every successful
+stream ends with exactly one `StreamEvent.Complete`, whose `result` contains the
+complete public model turn; transport, protocol, or decode failures instead
+terminate through the typed error channel. Shared streaming loops suppress
+intermediate completion markers and retain exact backend continuation blocks
+such as Converse reasoning signatures. If native Converse streams syntactically
+malformed tool-input JSON, previously emitted `ToolUseDelta` fragments remain
+observable, but completion assembly fails with `Error.Unexpected` before a
+terminal `Complete` can expose a normalized tool input.
 
 Messages returned by a backend privately retain the exact normalized assistant
 turn. This preserves signed Converse reasoning and other continuation data when
@@ -288,8 +337,9 @@ def runWithMcp(mcp: McpClient): ZIO[Bedrock, Throwable, DynamicLoopResult[String
 - `totals`, containing aggregate input/output/total tokens and cache tokens.
 
 Converse reports model latency in `Metrics.latencyMs`; Mantle's OpenAI Chat
-Completions response currently does not, so Mantle latency is `null` rather than
-an invented zero. Aggregate loop latency is also `null` if any turn is unknown.
+Completions response currently does not, so Mantle reports zero rather than a
+nullable or synthetic estimate. Aggregate loop latency is the sum of normalized
+per-turn values and is therefore also zero when no backend turn reports latency.
 Cache fields are populated whenever the selected backend supplies them.
 
 ```scala
@@ -406,7 +456,9 @@ object Weather extends ZIOAppDefault:
 
 ## Tests
 
-The default suite includes real local ZIO HTTP protocol tests for both backends.
+The default suite includes real local ZIO HTTP protocol tests for both backends,
+plus deterministic mock coverage for text/structured responses, loops, middleware,
+and forced-tool success and typed missing/multiple/unexpected/non-object failures.
 `MantleProtocolSpec` validates bearer auth, exact Chat Completions JSON,
 structured output, two-turn function tools, usage, and SSE. `ConverseProtocolSpec`
 validates native Converse JSON, model-path encoding, tool use/results,
@@ -429,3 +481,7 @@ AWS_BEARER_TOKEN_BEDROCK=… \
 BEDROCK_CONVERSE_TEST_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0 \
 ./sbt 'testOnly com.jamesward.zio_bedrock.ConverseIntegrationSpec'
 ```
+
+## Forced tool responses and metrics
+
+`Bedrock.chat(config).asForcedToolUse(name)` requires exactly one call to the expected tool and retains stop reason, usage, and normalized non-null latency. `asForcedToolObject(name)` additionally decodes the input as `Json.Obj`. Missing, multiple, unexpected-name, and non-object inputs use typed `Bedrock.Error` cases. Public `Metrics.latencyMs` and dynamic-loop aggregate latency are `Long`, using zero when a backend does not report latency.

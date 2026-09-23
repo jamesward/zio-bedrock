@@ -54,9 +54,13 @@ Mantle maps normalized history to OpenAI `assistant.tool_calls` and `role=tool` 
 
 Structured terminals generate an inline JSON Schema with `additionalProperties=false` recursively on object schemas. Successful text is decoded with the requested `Schema[T]`; failures surface as `Bedrock.Error.StructuredDecode`.
 
+## Forced tool responses
+
+`Bedrock.chat(...).asForcedToolUse(expected)` accepts only one invocation of the expected tool and preserves its input, stop reason, usage, and normalized metrics. `asForcedToolObject(expected)` additionally requires an object input. Missing, multiple, unexpected-name, and non-object inputs fail as typed `MissingToolUse`, `MultipleToolUses`, `UnexpectedToolUse`, and `InvalidToolInput` errors.
+
 ## Metrics
 
-`Metrics.latencyMs` is `Long | Null`. Converse preserves reported latency. Mantle reports `null` because Chat Completions currently provides no model-latency field. Aggregate loop latency is `null` if any constituent turn has unknown latency. Optional cache token counts remain `null` when not reported.
+`Metrics.latencyMs` is a non-null `Long`. Converse preserves reported latency. Mantle reports zero because Chat Completions currently provides no model-latency field. Aggregate loop latency sums normalized per-turn values. Optional cache token counts remain `null` when not reported.
 
 ## Streaming
 

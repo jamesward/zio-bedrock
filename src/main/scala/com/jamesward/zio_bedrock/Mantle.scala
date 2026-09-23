@@ -5,19 +5,25 @@ import com.jamesward.zio_bedrock.internal.MantleTransport
 import zio.*
 import zio.http.{Client, URL}
 
+/** Chat Completions API base exposed by a Mantle-served model. */
+enum MantleApi(val basePath: String):
+  case Standard extends MantleApi("/v1")
+  case OpenAI extends MantleApi("/openai/v1")
+
 /** Configuration for the Bedrock Mantle Chat Completions backend.
-  * `endpoint`, when supplied, replaces the regional AWS origin while retaining
-  * the standard `/v1/chat/completions` path.
+  * `endpoint`, when supplied, replaces the regional AWS origin. `api` selects
+  * the standard `/v1` or provider-specific `/openai/v1` API base.
   */
 final case class MantleConfig(
   apiKey: ApiKey,
   region: Region,
   modelId: ModelId,
   endpoint: URL | Null = null,
+  api: MantleApi = MantleApi.Standard,
 ):
   override def toString: String =
     val endpointDescription = if endpoint.asInstanceOf[AnyRef] eq null then "<regional>" else "<custom>"
-    s"MantleConfig(<redacted>, $region, ${modelId.unwrap}, $endpointDescription)"
+    s"MantleConfig(<redacted>, $region, ${modelId.unwrap}, $endpointDescription, $api)"
 
 object MantleConfig:
   /** Configuration for a Mantle-compatible custom origin. */

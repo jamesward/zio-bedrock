@@ -121,7 +121,7 @@ object ConverseProtocolSpec extends ZIOSpecDefault:
         result.usage.totalTokens == 10,
         result.usage.cacheReadInputTokens.asInstanceOf[Int] == 2,
         result.usage.cacheWriteInputTokens.asInstanceOf[Int] == 1,
-        result.metrics.latencyMs.asInstanceOf[Long] == 42L,
+        result.metrics.latencyMs == 42L,
       )
     },
 
@@ -202,7 +202,7 @@ object ConverseProtocolSpec extends ZIOSpecDefault:
         events.contains(StreamEvent.TextDelta("hello\n")),
         events.contains(StreamEvent.MessageStop(StopReason.StopSequence)),
         usage.contains(TokenUsage(5, 2, 7, 3, 1)),
-        metrics.exists(_.latencyMs.asInstanceOf[Long] == 1234L),
+        metrics.exists(_.latencyMs == 1234L),
         complete.exists(_.stopReason == StopReason.StopSequence),
         complete.exists(_.output.message.content.collect { case ContentBlock.Text(text) => text }.mkString == "hello\n"),
         complete.exists(_.output.message.content.exists {

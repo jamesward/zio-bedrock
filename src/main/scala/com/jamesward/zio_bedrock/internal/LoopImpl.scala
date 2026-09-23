@@ -22,8 +22,6 @@ private[zio_bedrock] object LoopImpl:
       if value.asInstanceOf[AnyRef] eq null then None else Some(value.asInstanceOf[Int])
 
     def totals(turns: List[LoopTurn]): LoopTotals =
-      def optionalLong(value: Long | Null): Option[Long] =
-        if value.asInstanceOf[AnyRef] eq null then None else Some(value.asInstanceOf[Long])
       val usages = turns.map(_.usage)
       val cacheReads = usages.flatMap(usage => optionalInt(usage.cacheReadInputTokens))
       val cacheWrites = usages.flatMap(usage => optionalInt(usage.cacheWriteInputTokens))
@@ -35,9 +33,7 @@ private[zio_bedrock] object LoopImpl:
           cacheReadInputTokens = if cacheReads.isEmpty then null else cacheReads.sum,
           cacheWriteInputTokens = if cacheWrites.isEmpty then null else cacheWrites.sum,
         ),
-        latencyMs =
-          val latencies = turns.flatMap(turn => optionalLong(turn.metrics.latencyMs))
-          if latencies.size == turns.size then latencies.sum else null,
+        latencyMs = turns.map(_.metrics.latencyMs).sum,
       )
 
     val initial = Tools.toWire(
