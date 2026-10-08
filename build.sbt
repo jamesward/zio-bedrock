@@ -2,7 +2,7 @@ organization := "com.jamesward"
 
 name := "zio-bedrock"
 
-scalaVersion := "3.9.0"
+scalaVersion := "3.10.0"
 
 scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
@@ -61,4 +61,4 @@ Global / mcpPort := 5116
 // SkillsJars: extract agent Skills with `./sbt extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.10" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.12" % Skills
