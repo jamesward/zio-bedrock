@@ -12,7 +12,7 @@ scalacOptions ++= Seq(
   // "-Xfatal-warnings", // not sure where it went
 )
 
-val zioVersion = "2.1.26"
+val zioVersion = "2.1.27"
 
 val zioSchemaVersion = "1.9.0"
 
@@ -61,4 +61,4 @@ ThisBuild / mcpPort := 5116
 // SkillsJars: extract agent Skills with `./sbt extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.12" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.15" % Skills
