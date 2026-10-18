@@ -466,7 +466,7 @@ usage/cache/latency, reasoning events, AWS EventStream framing, and errors.
 Neither needs AWS credentials.
 
 ```bash
-./sbt test
+./sbta test
 ```
 
 When `AWS_BEARER_TOKEN_BEDROCK` is available, both live suites run against
@@ -475,11 +475,11 @@ AWS. Backend-specific variables only override the model and region.
 ```bash
 AWS_BEARER_TOKEN_BEDROCK=… \
 BEDROCK_MANTLE_TEST_MODEL_ID=openai.gpt-oss-120b \
-./sbt 'testOnly com.jamesward.zio_bedrock.MantleIntegrationSpec'
+./sbta 'testOnly com.jamesward.zio_bedrock.MantleIntegrationSpec'
 
 AWS_BEARER_TOKEN_BEDROCK=… \
 BEDROCK_CONVERSE_TEST_MODEL_ID=us.anthropic.claude-sonnet-4-5-20250929-v1:0 \
-./sbt 'testOnly com.jamesward.zio_bedrock.ConverseIntegrationSpec'
+./sbta 'testOnly com.jamesward.zio_bedrock.ConverseIntegrationSpec'
 ```
 
 ## Forced tool responses and metrics
