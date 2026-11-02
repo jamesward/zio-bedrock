@@ -37,6 +37,8 @@ trait BedrockMiddleware { self =>
     ZLayer.fromFunction: (underlying: Bedrock) =>
       new Bedrock:
         private[zio_bedrock] val protocol: Protocol = new Protocol:
+          override def structuredOutputByToolCall: Boolean = underlying.protocol.structuredOutputByToolCall
+
           def send(request: Wire.ChatRequest): IO[Error, Wire.ChatResponse] =
             self(
               Request(Operation.Unary, encode(request)),

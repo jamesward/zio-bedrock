@@ -133,11 +133,15 @@ object Bedrock:
 
   // ---------- Inference / metrics ----------
 
+  /** @param reasoningEffort how much a reasoning model thinks before it answers (`low`, `medium`, `high`), for models
+    *                        that take it (OpenAI's gpt-oss): Mantle's `reasoning_effort`, Converse's
+    *                        `additionalModelRequestFields.reasoning_effort`; unset, the model's default */
   case class InferenceConfig(
     maxTokens:     Int    | Null = null,
     temperature:   Double | Null = null,
     topP:          Double | Null = null,
     stopSequences: List[String]  = Nil,
+    reasoningEffort: String | Null = null,
   ) derives Schema
 
   case class TokenUsage(
@@ -681,6 +685,10 @@ object Bedrock:
       def errorMessage = s"Expected one tool use for $expected, but the model returned $actual"
     final case class UnexpectedToolUse(expected: ToolName, actual: ToolName) extends Error:
       def errorMessage = s"Expected tool use $expected, but the model called $actual"
+    /** Structured output by a forced call (`asJsonObject` on Mantle) got a call of another tool, `actual`, whose
+      * arguments don't fit the schema asked for: the model wrote something else. `input` is what it wrote. */
+    final case class OtherToolUse(expected: ToolName, actual: ToolName, input: Json.Obj) extends Error:
+      def errorMessage = s"Expected tool use $expected, but the model called $actual"
     final case class Unexpected         (status: Status, body: String)                   extends Error:
       def errorMessage = s"Bedrock unexpected ${status.code}: $body"
     final case class Transport          (cause: Throwable)                               extends Error:
@@ -780,6 +788,70 @@ object Bedrock:
         ZIO.fromEither(toolUse.input.asJsonObject)
           .mapError(message => Error.InvalidToolInput(expected, message))
           .map(value => Result(value, toolUse.stopReason, toolUse.usage, toolUse.metrics))
+
+    /** Structured output against a JSON Schema known only at runtime. On
+      * Converse the model is told to produce JSON matching `schema` (object
+      * schemas are made strict, as Bedrock requires) and the final text block
+      * is decoded as a JSON object; like [[as]], prose or markdown around an
+      * otherwise valid object is tolerated. On Mantle, whose models take a
+      * response format only as a hint, the request instead offers one tool,
+      * `name`, taking `schema`, and forces the model to call it: the call's
+      * arguments are the output, and no other tool is offered (any in this
+      * request's configuration are replaced). The schema itself is not
+      * validated on the result; validate it where that matters. */
+    def asJsonObject(
+      schema: Json.Obj,
+      name: String = "structured_output",
+      description: Option[String] = None,
+    ): ZIO[Bedrock, Error, Result[Json.Obj]] =
+      ZIO.serviceWithZIO[Bedrock]: client =>
+        if client.protocol.structuredOutputByToolCall then
+          val tool = Tool.dynamic(ToolName(name), description.getOrElse(name), schema)
+          // only `name` is offered, so a call under another name (gpt-oss sometimes names one it saw in the prompt)
+          // is taken when its arguments fit `schema`; otherwise the model wrote something else
+          val required = schema.get("required").flatMap(_.asArray).toList.flatten.flatMap(_.asString)
+          val properties = schema.get("properties").flatMap(_.asObject).map(_.keys.toSet).getOrElse(Set.empty)
+          // arguments for another tool fit when they have what's required and nothing the schema doesn't name
+          def fits(value: Json.Obj) = value.keys.nonEmpty && required.forall(value.contains) && value.keys.forall(properties)
+          new Request(cfg.copy(toolConfig = ToolConfig(List(tool), ToolChoice.Tool(ToolName(name))))).asResponse.flatMap: response =>
+            val uses = response.output.message.content.collect { case ContentBlock.ToolUse(_, called, input) => called -> input }
+            uses match
+              // a model that writes the arguments as text instead of calling: the text's object, when it fits
+              case Nil =>
+                Helpers.decodeStructured[Json](response.output.text).toOption.flatMap(_.asObject).filter(fits) match
+                  case Some(value) => ZIO.succeed(Result(value, response.stopReason, response.usage, response.metrics))
+                  case None        => ZIO.fail(Error.MissingToolUse(ToolName(name)))
+              case _ :: _ :: _  => ZIO.fail(Error.MultipleToolUses(ToolName(name), uses.size))
+              case (called, input) :: Nil =>
+                ZIO.fromEither(input.asJsonObject).mapError(message => Error.InvalidToolInput(ToolName(name), message))
+                  .flatMap(value =>
+                    if called == ToolName(name) || fits(value) then ZIO.succeed(value)
+                    else ZIO.fail(Error.OtherToolUse(ToolName(name), called, value)))
+                  .map(value => Result(value, response.stopReason, response.usage, response.metrics))
+        else asJsonObjectByResponseFormat(schema, name, description)
+
+    private def asJsonObjectByResponseFormat(
+      schema: Json.Obj,
+      name: String,
+      description: Option[String],
+    ): ZIO[Bedrock, Error, Result[Json.Obj]] =
+      val outCfg = Wire.OutputConfig(Wire.TextFormat.JsonSchema(
+        Wire.JsonSchemaStructure(Wire.JsonSchemaSpec(
+          schema = Helpers.withStrictObjects(schema: Json).toString,
+          name   = name,
+          description = description,
+        )),
+      ))
+      ZIO.serviceWithZIO[Bedrock]: client =>
+        client.protocol.send(Tools.toWire(cfg, outputConfig = Some(outCfg))).flatMap: wire =>
+          val text = wire.output.message.content.collect:
+            case Wire.ContentBlock.Text(t) => t
+          .mkString
+          if text.isEmpty then ZIO.fail(Error.StructuredDecode("", "no text block in response"))
+          else
+            Helpers.decodeStructured[Json](text).flatMap(_.asObject.toRight("response was not a JSON object")) match
+              case Right(value) => ZIO.succeed(Result(value, wire.stopReason, wire.usage, wire.metrics))
+              case Left(error)  => ZIO.fail(Error.StructuredDecode(text, error))
 
     /** Structured output: the model is told to produce JSON matching
       * `Schema[T]`, and the final text block is decoded into a `T`. */

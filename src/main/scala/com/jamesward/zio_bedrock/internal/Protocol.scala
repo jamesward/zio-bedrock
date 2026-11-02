@@ -12,6 +12,13 @@ import zio.stream.ZStream
 private[zio_bedrock] trait Protocol:
   def send(request: Wire.ChatRequest): IO[Error, Wire.ChatResponse]
 
+  /**
+   * Whether structured output against a runtime schema is asked for as one forced tool call rather than as a response
+   * format: on Mantle, models such as gpt-oss take `response_format` only as a hint (writing prose before the JSON, or
+   * JSON that doesn't match), while a forced call's arguments follow the schema.
+   */
+  def structuredOutputByToolCall: Boolean = false
+
   /** Backend decoder output. Implementations must emit one final Complete. */
   def sendStreamEvents(request: Wire.ChatRequest): ZStream[Any, Error, StreamEvent]
 

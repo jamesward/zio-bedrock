@@ -49,6 +49,77 @@ object MantleProtocolSpec extends ZIOSpecDefault:
     ))
 
   def spec = suite("Bedrock Mantle protocol integration")(
+    test("asJsonObject asks for one forced tool call taking the runtime JSON Schema, and gives its arguments") {
+      def call(name: String, arguments: String) =
+        s"""{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"We need to read it.","tool_calls":[{"id":"t1","type":"function","function":{"name":"$name","arguments":${arguments.toJson}}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}"""
+      for
+        captured <- Promise.make[Nothing, String]
+        routes = Routes(
+          Method.POST / "v1" / "chat" / "completions" -> handler { (request: HttpRequest) =>
+            request.body.asString.orDie.flatMap: body =>
+              captured.succeed(body) *> ZIO.succeed(Response.json(call("arguments", """{"customerId":"C0046"}""")))
+          },
+        )
+        port   <- Server.install(routes)
+        http   <- ZIO.service[HttpClient]
+        schema  = Json.Obj(
+                    "type" -> Json.Str("object"),
+                    "properties" -> Json.Obj("customerId" -> Json.Obj("type" -> Json.Str("string"))),
+                    "required" -> Json.Arr(Json.Str("customerId")),
+                  )
+        result <- Bedrock.chat("Arguments for list_orders").asJsonObject(schema, "arguments", Some("Arguments for list_orders"))
+                    .provideLayer(clientLayer(http, port))
+        body   <- captured.await.map(json)
+        tools   = field(body, "tools").asArray.toList.flatten
+        function = field(tools.head, "function")
+      yield assertTrue(
+        result.output.toJson == """{"customerId":"C0046"}""",
+        result.usage.outputTokens == 2,
+        tools.size == 1,
+        field(function, "name").asString.contains("arguments"),
+        field(function, "description").asString.contains("Arguments for list_orders"),
+        field(field(function, "parameters"), "required").toJson == """["customerId"]""",
+        field(body, "tool_choice").toJson == """{"type":"function","function":{"name":"arguments"}}""",
+        body.get("response_format").isEmpty,
+      )
+    },
+    test("a middleware over Mantle keeps asJsonObject's forced tool call") {
+      for
+        captured <- Promise.make[Nothing, String]
+        routes = Routes(
+          Method.POST / "v1" / "chat" / "completions" -> handler { (request: HttpRequest) =>
+            request.body.asString.orDie.flatMap(body => captured.succeed(body) *> ZIO.succeed(Response.json(completion("{}"))))
+          },
+        )
+        port   <- Server.install(routes)
+        http   <- ZIO.service[HttpClient]
+        logged  = BedrockMiddleware.observe((_, _, _) => ZIO.unit)
+        _      <- Bedrock.chat("x").asJsonObject(Json.Obj("type" -> Json.Str("object")), "arguments")
+                    .provideLayer(clientLayer(http, port) @@ logged).either
+        body   <- captured.await.map(json)
+      yield assertTrue(body.get("tool_choice").isDefined, body.get("response_format").isEmpty)
+    },
+    test("asJsonObject fails when the model doesn't call the forced tool; another tool's call, or text, counts when it fits") {
+      val replies = List(completion("""{"customerId":"C0046"}"""), toolCompletion, toolCompletion, completion("Done: {\"city\":\"Rome\"}"))
+      for
+        index  <- Ref.make(0)
+        routes  = Routes(
+                    Method.POST / "v1" / "chat" / "completions" -> handler { (_: HttpRequest) =>
+                      index.getAndUpdate(_ + 1).map(i => Response.json(replies(i)))
+                    },
+                  )
+        port   <- Server.install(routes)
+        http   <- ZIO.service[HttpClient]
+        schema  = Json.Obj("type" -> Json.Str("object"), "properties" -> Json.Obj("city" -> Json.Obj("type" -> Json.Str("string"))))
+        other   = Json.Obj("type" -> Json.Str("object"), "required" -> Json.Arr(Json.Str("file_path")))
+        got    <- ZIO.foreach(List(schema, schema, other, schema))(s => Bedrock.chat("x").asJsonObject(s, "arguments").provideLayer(clientLayer(http, port)).either)
+      yield assertTrue(
+        got(0).left.toOption.map(_.toString).contains(Error.MissingToolUse(ToolName("arguments")).toString),
+        got(1).map(_.output.toJson) == Right("""{"city":"Paris"}"""),
+        got(3).map(_.output.toJson) == Right("""{"city":"Rome"}"""),
+        got(2).left.toOption.map(_.toString).contains(Error.OtherToolUse(ToolName("arguments"), ToolName("weather"), Json.Obj("city" -> Json.Str("Paris"))).toString),
+      )
+    },
     test("encodes OpenAI chat, tools, structured output, inference config, and bearer auth") {
       for
         captured <- Promise.make[Nothing, (HttpRequest, String)]

@@ -125,6 +125,28 @@ object ConverseProtocolSpec extends ZIOSpecDefault:
       )
     },
 
+    test("asJsonObject sends a runtime JSON Schema as a strict output config, with no tools") {
+      for
+        captured <- Promise.make[Nothing, String]
+        routes = Routes(
+          RoutePattern.any -> handler { (request: HttpRequest) =>
+            request.body.asString.orDie.flatMap: body =>
+              captured.succeed(body) *> ZIO.succeed(Response.json(responseJson))
+          },
+        )
+        port   <- Server.install(routes)
+        http   <- ZIO.service[HttpClient]
+        schema  = Json.Obj("type" -> Json.Str("object"), "properties" -> Json.Obj("city" -> Json.Obj("type" -> Json.Str("string"))))
+        result <- Bedrock.chat("Forecast").asJsonObject(schema, "forecast").provideLayer(clientLayer(http, port))
+        obj    <- captured.await.map(json)
+        format  = field(field(obj, "outputConfig"), "textFormat")
+      yield assertTrue(
+        result.output.get("city").contains(Json.Str("Seattle")),
+        obj.get("toolConfig").isEmpty,
+        format.asObject.flatMap(_.get("type")).flatMap(_.asString).contains("json_schema"),
+        format.toJson.contains("additionalProperties"),
+      )
+    },
     test("loop sends assistant tool use and native user tool result history") {
       for
         bodies <- Ref.make(List.empty[String])

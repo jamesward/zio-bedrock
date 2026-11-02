@@ -64,6 +64,7 @@ private[zio_bedrock] object MantleWire:
     tools: List[Tool] = Nil,
     @fieldName("tool_choice") toolChoice: Option[Json] = None,
     @fieldName("response_format") responseFormat: Option[ResponseFormat] = None,
+    @fieldName("reasoning_effort") reasoningEffort: Option[String] = None,
     stream: Option[Boolean] = None,
     @fieldName("stream_options") streamOptions: Option[StreamOptions] = None,
   ) derives Schema
@@ -167,6 +168,7 @@ private[zio_bedrock] object MantleWire:
       tools = tools,
       toolChoice = toolChoice,
       responseFormat = responseFormat,
+      reasoningEffort = inference.flatMap(i => optional(i.reasoningEffort)),
       stream = if streaming then Some(true) else None,
       streamOptions = if streaming then Some(StreamOptions()) else None,
     )

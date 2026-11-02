@@ -1,3 +1,5 @@
+`zio-bedrock` (`com.jamesward` %% `zio-bedrock`) is a Scala 3 / ZIO library with one typed API for Amazon Bedrock's Converse and its OpenAI-compatible Mantle APIs, published to Maven Central with sbt-ci-release.
+
 ## Guidance
 
 - Sometimes sbt incremental compilation fails with errors like `ClassNotFoundException` - just `./sbta clean` and try again.

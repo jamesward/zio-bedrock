@@ -27,6 +27,8 @@ private[zio_bedrock] object MantleTransport:
     chatCompletionsPath: String,
     hc: Client,
   ) extends Protocol:
+    override def structuredOutputByToolCall: Boolean = true
+
 
     private val requestCodec = JsonCodec.schemaBasedBinaryCodec[MantleWire.Request](Codecs.codecConfig)
     private val responseCodec = JsonCodec.schemaBasedBinaryCodec[MantleWire.Response](Codecs.codecConfig)

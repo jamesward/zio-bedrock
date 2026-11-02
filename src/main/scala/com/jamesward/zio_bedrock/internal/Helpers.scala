@@ -20,6 +20,19 @@ private[zio_bedrock] object Helpers:
       case a: JS.ArrayType       => a.copy(items  = a.items .map(withStrictObjects))
       case other                  => other
 
+  /** As [[withStrictObjects]], for a JSON Schema document given as JSON: every object schema without an
+    * `additionalProperties` gets `additionalProperties: false`, which Bedrock structured output requires. */
+  def withStrictObjects(schema: zio.json.ast.Json): zio.json.ast.Json =
+    import zio.json.ast.Json
+    schema match
+      case Json.Obj(fields) =>
+        val strict = Json.Obj(fields.map((key, value) => key -> withStrictObjects(value)))
+        val isObject = strict.get("type").contains(Json.Str("object")) || strict.get("properties").isDefined
+        if isObject && strict.get("additionalProperties").isEmpty then Json.Obj(strict.fields :+ ("additionalProperties" -> Json.Bool(false)))
+        else strict
+      case Json.Arr(values) => Json.Arr(values.map(withStrictObjects))
+      case other            => other
+
   def fromWireToolUse(tu: Wire.ToolUseContent): ContentBlock.ToolUse =
     ContentBlock.ToolUse(
       toolUseId = tu.toolUseId,
@@ -79,19 +92,39 @@ private[zio_bedrock] object Helpers:
   /** Decode structured output exactly, with a narrow recovery path for models
     * that wrap an otherwise-valid JSON object/array in prose or markdown.
     */
+  /** The index of the bracket closing the one at `start`, skipping string contents; none when it isn't closed. */
+  private def balancedEnd(text: String, start: Int): Option[Int] =
+    @scala.annotation.tailrec
+    def scan(i: Int, depth: Int, inString: Boolean, escaped: Boolean): Option[Int] =
+      if i >= text.length then None
+      else
+        val c = text.charAt(i)
+        if inString then scan(i + 1, depth, inString = !(c == '"' && !escaped), escaped = !escaped && c == '\\')
+        else if c == '"' then scan(i + 1, depth, inString = true, escaped = false)
+        else if c == '{' || c == '[' then scan(i + 1, depth + 1, inString = false, escaped = false)
+        else if c == '}' || c == ']' then
+          if depth == 1 then Some(i) else scan(i + 1, depth - 1, inString = false, escaped = false)
+        else scan(i + 1, depth, inString = false, escaped = false)
+    scan(start, 0, inString = false, escaped = false)
+
   def decodeStructured[T: zio.schema.Schema](text: String): Either[String, T] =
     val codec = zio.schema.codec.JsonCodec.schemaBasedBinaryCodec[T](Codecs.codecConfig)
     def decode(value: String): Either[String, T] =
       codec.decode(zio.Chunk.fromArray(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
         .left.map(_.message)
 
+    // Each `{` or `[` is a candidate start, ending at the last matching close: models sometimes put stray characters,
+    // even a lone brace, before the JSON (`{\n{"a":1}`, `{"{"a":1}`), so the first candidate isn't always the one.
     decode(text).orElse:
-      val objectStart = text.indexOf('{')
-      val arrayStart = text.indexOf('[')
-      val start = List(objectStart, arrayStart).filter(_ >= 0).minOption
-      start match
-        case None => Left("response did not contain a JSON object or array")
-        case Some(index) =>
-          val end = if text.charAt(index) == '{' then text.lastIndexOf('}') else text.lastIndexOf(']')
-          if end <= index then Left("response contained incomplete JSON")
-          else decode(text.substring(index, end + 1))
+      val starts = text.indices.filter(i => text.charAt(i) == '{' || text.charAt(i) == '[')
+      if starts.isEmpty then Left("response did not contain a JSON object or array")
+      else
+        // each start tried to its balanced close first (JSON followed by prose: `{"a":1} Done, {see above}`), then
+        // to the last close of its kind
+        val attempts = starts.iterator.map: index =>
+          val balanced = balancedEnd(text, index).map(end => decode(text.substring(index, end + 1)))
+          balanced.filter(_.isRight).getOrElse:
+            val end = if text.charAt(index) == '{' then text.lastIndexOf('}') else text.lastIndexOf(']')
+            if end <= index then Left("response contained incomplete JSON") else decode(text.substring(index, end + 1))
+        val first = attempts.next()
+        if first.isRight then first else attempts.find(_.isRight).getOrElse(first)

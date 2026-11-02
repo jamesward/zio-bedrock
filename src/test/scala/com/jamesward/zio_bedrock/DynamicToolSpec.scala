@@ -106,6 +106,22 @@ object DynamicToolSpec extends ZIOSpecDefault:
             def sendStreamEvents(request: Wire.ChatRequest) = ZStream.empty
 
   def spec = suite("dynamic tools")(
+    test("a dynamic loop with no tools sends no tool configuration, so either API accepts it") {
+      for
+        requests <- Ref.make(List.empty[Wire.ChatRequest])
+        result   <- Bedrock.dynamicLoop[Any, Nothing]("hi", Nil)((_, _) => ZIO.succeed(DynamicToolResult.text("unused")))
+                      .text
+                      .provideLayer(BedrockMock(BedrockMock.MockBehavior.Reply("hello")))
+                      .either
+        wire      = Tools.toWire(RequestConfig(messages = List(Message.user("hi")), toolConfig = ToolConfig(Nil)), None)
+        mantle    = com.jamesward.zio_bedrock.internal.MantleWire.request(wire, ModelId("m"), streaming = false)
+      yield assertTrue(
+        result.map(_.output) == Right("hello"),
+        wire.toolConfig.isEmpty,
+        mantle.tools.isEmpty,
+        mantle.toolChoice.isEmpty,
+      )
+    },
     test("dynamic name and description are forwarded") {
       val tool = Tool.dynamic(ToolName("runtime_search"), "Runtime-provided description", Json.Obj())
       val spec = encodedToolSpec(tool)

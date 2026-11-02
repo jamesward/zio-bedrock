@@ -195,6 +195,17 @@ pass a `RequestConfig` directly.
 A structured-output decode failure surfaces as
 `Bedrock.Error.StructuredDecode(responseText, message)`.
 
+`asJsonObject(schema, name, description)` is structured output against a JSON
+Schema known only at runtime (a tool's input schema, say), decoded as a JSON
+object. On Converse it is a strict output config. On Mantle, whose models take
+`response_format` only as a hint (gpt-oss writes prose before the JSON, or JSON
+that doesn't match), it is one forced call of a function `name` taking
+`schema`, whose arguments are the result; nothing is offered to call
+otherwise. Name the function for what the model is writing: gpt-oss calls a
+function named after what the prompt asks for, so an unrelated name can get
+`Error.UnexpectedToolUse` (as can a model that doesn't call it,
+`Error.MissingToolUse`).
+
 `asStream` exposes normalized delta, stop, and metadata events. Every successful
 stream ends with exactly one `StreamEvent.Complete`, whose `result` contains the
 complete public model turn; transport, protocol, or decode failures instead

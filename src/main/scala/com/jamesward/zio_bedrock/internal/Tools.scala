@@ -26,9 +26,11 @@ private[zio_bedrock] object Tools:
     val inference =
       if cfg.inferenceConfig.asInstanceOf[AnyRef] eq null then None
       else Some(cfg.inferenceConfig.asInstanceOf[InferenceConfig])
+    // A tool configuration without tools is no configuration: both APIs reject one (Mantle refuses a `tool_choice`
+    // without `tools`, Converse a `toolConfig` with no tools), so a request with no tools carries none.
     val tools =
       if cfg.toolConfig.asInstanceOf[AnyRef] eq null then None
-      else Some(toWireToolConfig(cfg.toolConfig.asInstanceOf[ToolConfig]))
+      else Option(cfg.toolConfig.asInstanceOf[ToolConfig]).filter(_.tools.nonEmpty).map(toWireToolConfig)
     Wire.ChatRequest(
       messages        = messages,
       system          = system,

@@ -3,6 +3,8 @@ package com.jamesward.zio_bedrock.internal
 import com.jamesward.zio_bedrock.Bedrock.*
 import zio.schema.{Schema, derived}
 import zio.schema.annotation.caseName
+import zio.json.ast.Json
+import zio.schema.codec.json.schemaJson
 
 /** Exact JSON envelope used by Amazon Bedrock's native Converse API.
   * Shared builders produce [[Wire.ChatRequest]]; this boundary supplies the
@@ -13,12 +15,23 @@ private[zio_bedrock] object ConverseWire:
   case class Request(
     messages:        List[Wire.WireMessage],
     system:          List[Wire.SystemContentBlock]   = Nil,
-    inferenceConfig: Option[InferenceConfig]         = None,
+    inferenceConfig: Option[Inference]               = None,
     toolConfig:      Option[Wire.ToolConfig]         = None,
     outputConfig:    Option[Wire.OutputConfig]       = None,
     requestMetadata: Map[String, String]             = Map.empty,
     additionalModelResponseFieldPaths: List[String] = Nil,
+    additionalModelRequestFields: Option[Json] = None,
   ) derives Schema
+
+  /** Converse's `inferenceConfig`: the public one without what Converse takes elsewhere (the reasoning effort). */
+  case class Inference(
+    maxTokens:     Option[Int]    = None,
+    temperature:   Option[Double] = None,
+    topP:          Option[Double] = None,
+    stopSequences: List[String]   = Nil,
+  ) derives Schema
+
+  private def optional[A](value: A | Null): Option[A] = Option(value.asInstanceOf[AnyRef]).map(_.asInstanceOf[A])
 
   enum StopReason derives Schema:
     @caseName("end_turn")                      case EndTurn
@@ -43,11 +56,14 @@ private[zio_bedrock] object ConverseWire:
     Request(
       messages = value.messages,
       system = value.system,
-      inferenceConfig = value.inferenceConfig,
+      inferenceConfig = value.inferenceConfig.map(i =>
+        Inference(optional(i.maxTokens), optional(i.temperature), optional(i.topP), i.stopSequences)),
       toolConfig = value.toolConfig,
       outputConfig = value.outputConfig,
       requestMetadata = value.requestMetadata,
       additionalModelResponseFieldPaths = value.additionalModelResponseFieldPaths,
+      additionalModelRequestFields = value.inferenceConfig.flatMap(i => optional(i.reasoningEffort))
+        .map(effort => Json.Obj("reasoning_effort" -> Json.Str(effort))),
     )
 
   def response(value: Response): Wire.ChatResponse =
