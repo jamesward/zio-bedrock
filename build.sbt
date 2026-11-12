@@ -14,7 +14,7 @@ scalacOptions ++= Seq(
 
 val zioVersion = "2.1.27"
 
-val zioSchemaVersion = "1.9.0"
+val zioSchemaVersion = "1.9.1"
 
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                    % zioVersion,
@@ -56,4 +56,4 @@ ThisBuild / versionScheme := Some("semver-spec")
 // SkillsJars: extract agent Skills with `./sbta extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.22" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.26" % Skills
